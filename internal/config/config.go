@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,13 +71,43 @@ type ListenerConfig struct {
 	Password string `yaml:"password"`
 }
 
-// StickyConfig configures an optional dedicated sticky-session entry port.
-// When enabled (pool/hybrid mode only), clients connecting to this port are
-// pinned to a single upstream node by source IP, keeping the egress IP stable.
-// The sticky port reuses the listener's address and credentials.
+// StickyConfig controls authenticated username.session routing on the main
+// pool listener and the optional legacy source-IP sticky entry. The legacy
+// port reuses the listener's address and credentials.
 type StickyConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Port    uint16 `yaml:"port"`
+	// SessionEnabled enables authenticated username.session routing on the
+	// regular pool listener. Unset defaults to true; Enabled/Port above retain
+	// the legacy source-IP entry point for backward compatibility.
+	SessionEnabled *bool         `yaml:"session_enabled,omitempty"`
+	SessionTTL     time.Duration `yaml:"session_ttl,omitempty"`
+	MaxSessions    int           `yaml:"max_sessions,omitempty"`
+}
+
+const (
+	DefaultSessionTTL  = 24 * time.Hour
+	DefaultMaxSessions = 10000
+	MaxSessionCapacity = 100000
+	MaxSessionTTL      = 365 * 24 * time.Hour
+)
+
+func (s StickyConfig) SessionRoutingEnabled() bool {
+	return s.SessionEnabled == nil || *s.SessionEnabled
+}
+
+func (s StickyConfig) SessionTTLOrDefault() time.Duration {
+	if s.SessionTTL <= 0 {
+		return DefaultSessionTTL
+	}
+	return s.SessionTTL
+}
+
+func (s StickyConfig) MaxSessionsOrDefault() int {
+	if s.MaxSessions <= 0 {
+		return DefaultMaxSessions
+	}
+	return s.MaxSessions
 }
 
 // PoolConfig configures scheduling + failure handling.
@@ -213,11 +244,29 @@ func stableNodeKey(uri string) string {
 		return ""
 	}
 
-	// vmess:// is base64-encoded JSON rather than a standard URL; only strip an
-	// appended fragment and keep the payload as the identity.
-	if strings.HasPrefix(uri, "vmess://") {
+	// VMess accepts both base64 JSON and URL-format links. Only the encoded
+	// payload needs special treatment; URL links are canonicalized below.
+	if strings.HasPrefix(uri, "vmess://") && !strings.Contains(uri, "@") {
 		if idx := strings.Index(uri, "#"); idx != -1 {
-			return strings.TrimSpace(uri[:idx])
+			uri = strings.TrimSpace(uri[:idx])
+		}
+		payload := strings.TrimPrefix(uri, "vmess://")
+		for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+			decoded, err := encoding.DecodeString(payload)
+			if err != nil {
+				continue
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(decoded, &fields); err != nil || len(fields) == 0 {
+				continue
+			}
+			// VMess's display name lives inside its encoded JSON, not just in a
+			// URL fragment. It must not change a session's upstream identity.
+			delete(fields, "ps")
+			canonical, err := json.Marshal(fields)
+			if err == nil {
+				return "vmess://" + base64.RawURLEncoding.EncodeToString(canonical)
+			}
 		}
 		return uri
 	}
@@ -240,7 +289,7 @@ func stableNodeKey(uri string) string {
 
 // Load reads YAML config from disk and applies defaults/validation.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := readFileWithLock(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
@@ -249,6 +298,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 	cfg.filePath = path
+	// Track YAML-owned ports before normalize adds provisional assignments and
+	// appends file/subscription nodes. Explicit inline ports are user intent.
+	explicitPorts := make([]bool, len(cfg.Nodes))
+	for idx := range cfg.Nodes {
+		explicitPorts[idx] = cfg.Nodes[idx].Port > 0
+	}
 
 	// Resolve nodes_file path relative to config file directory
 	if cfg.NodesFile != "" && !filepath.IsAbs(cfg.NodesFile) {
@@ -261,7 +316,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	// Restore persisted proxy ports so a restart keeps the same port per node.
-	if err := cfg.applyPersistedPorts(); err != nil {
+	if err := cfg.applyPersistedPorts(explicitPorts); err != nil {
 		return nil, err
 	}
 
@@ -275,7 +330,7 @@ func ExtractNodeName(uri string) string {
 	uri = strings.TrimSpace(uri)
 
 	// Handle vmess:// specially - it's base64-encoded JSON, not a standard URL
-	if strings.HasPrefix(uri, "vmess://") {
+	if strings.HasPrefix(uri, "vmess://") && !strings.Contains(uri, "@") {
 		payload := strings.TrimPrefix(uri, "vmess://")
 		// Remove any fragment that might be appended
 		if idx := strings.Index(payload, "#"); idx != -1 {
@@ -285,13 +340,7 @@ func ExtractNodeName(uri string) string {
 		// Try standard base64 first, then raw/URL-safe variants
 		var decoded []byte
 		var err error
-		decoded, err = base64.StdEncoding.DecodeString(payload)
-		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(payload)
-		}
-		if err != nil {
-			decoded, err = base64.RawURLEncoding.DecodeString(payload)
-		}
+		decoded, err = decodeProxyBase64(payload)
 		if err == nil {
 			var vmess struct {
 				PS string `json:"ps"`
@@ -306,7 +355,7 @@ func ExtractNodeName(uri string) string {
 	// For standard URIs, extract from URL fragment (#name)
 	if idx := strings.LastIndex(uri, "#"); idx != -1 && idx < len(uri)-1 {
 		fragment := uri[idx+1:]
-		if decoded, err := url.QueryUnescape(fragment); err == nil && decoded != "" {
+		if decoded, err := url.PathUnescape(fragment); err == nil && decoded != "" {
 			return strings.TrimSpace(decoded)
 		}
 		return strings.TrimSpace(fragment)
@@ -334,8 +383,10 @@ func (c *Config) normalize() error {
 	if c.Listener.Port == 0 {
 		c.Listener.Port = 2323
 	}
-	if c.Pool.Mode == "" {
-		c.Pool.Mode = "sequential"
+	if mode, err := normalizePoolMode(c.Pool.Mode); err != nil {
+		return err
+	} else {
+		c.Pool.Mode = mode
 	}
 	if c.Pool.FailureThreshold <= 0 {
 		c.Pool.FailureThreshold = 3
@@ -452,6 +503,7 @@ func (c *Config) normalize() error {
 	// portCursor is an int (not uint16) so the >65535 exhaustion guard fires
 	// instead of wrapping to 0 and assigning unbindable low ports.
 	portCursor := int(c.MultiPort.BasePort)
+	reservedPorts := c.reservedListenerPorts()
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
 		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
@@ -475,9 +527,17 @@ func (c *Config) normalize() error {
 		// would double the socket open/close work at startup (16k+ syscalls for
 		// 8k nodes) for a result that is immediately discarded.
 		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
-			c.Nodes[idx].Port = uint16(portCursor)
-			portCursor++
-		} else if c.Nodes[idx].Port == 0 {
+			for portCursor <= 65535 && reservedPorts[uint16(portCursor)] {
+				portCursor++
+			}
+			// A narrow provisional range may be exhausted even when every node
+			// has a valid saved assignment elsewhere. Defer that decision until
+			// applyPersistedPorts has restored the sidecar instead of failing early.
+			if portCursor <= 65535 {
+				c.Nodes[idx].Port = uint16(portCursor)
+				portCursor++
+			}
+		} else if c.Nodes[idx].Port == 0 && portCursor <= 65535 {
 			c.Nodes[idx].Port = uint16(portCursor)
 			portCursor++
 		}
@@ -499,24 +559,26 @@ func (c *Config) normalize() error {
 	// Auto-fix port conflicts in hybrid mode (pool port vs multi-port)
 	if c.Mode == "hybrid" {
 		poolPort := c.Listener.Port
-		usedPorts := make(map[uint16]bool)
-		usedPorts[poolPort] = true
+		usedPorts := c.reservedListenerPorts()
 		for idx := range c.Nodes {
 			usedPorts[c.Nodes[idx].Port] = true
 		}
 		for idx := range c.Nodes {
 			if c.Nodes[idx].Port == poolPort {
 				// Find next available port
-				newPort := c.Nodes[idx].Port + 1
-				for usedPorts[newPort] || !IsPortAvailable(c.MultiPort.Address, newPort) {
+				newPort := int(c.Nodes[idx].Port) + 1
+				for newPort <= 65535 && (usedPorts[uint16(newPort)] || !IsPortAvailable(c.MultiPort.Address, uint16(newPort))) {
 					newPort++
 					if newPort > 65535 {
 						return fmt.Errorf("no available port for node %q after conflict with pool port %d", c.Nodes[idx].Name, poolPort)
 					}
 				}
+				if newPort > 65535 {
+					return fmt.Errorf("no available port after pool port %d", poolPort)
+				}
 				log.Printf("⚠️  Node %q port %d conflicts with pool port, reassigned to %d", c.Nodes[idx].Name, poolPort, newPort)
-				usedPorts[newPort] = true
-				c.Nodes[idx].Port = newPort
+				usedPorts[uint16(newPort)] = true
+				c.Nodes[idx].Port = uint16(newPort)
 			}
 		}
 	}
@@ -560,7 +622,7 @@ func loadNodePortMap(path string) map[string]uint16 {
 	if path == "" {
 		return nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileWithLock(path)
 	if err != nil {
 		return nil
 	}
@@ -572,21 +634,42 @@ func loadNodePortMap(path string) map[string]uint16 {
 }
 
 // bridgeLegacyPortKeys upgrades a port-map sidecar written by an older version
-// (keyed by the raw full node URI) to the current stable-key scheme. For each
-// node whose stable key is absent but whose raw URI is present in the map, it
-// copies the port under the stable key. This makes a one-time format upgrade
+// (keyed by raw full URIs or an earlier canonicalization) to the current
+// stable-key scheme. Normalizing stored keys also preserves renamed encoded
+// VMess nodes when upgrading from versions whose identity included `ps`.
+// This makes a one-time format upgrade
 // transparent: ports are preserved instead of all being reassigned on the first
 // boot after upgrading. It mutates saved in place and is a no-op once the
 // sidecar has been rewritten with stable keys.
 func bridgeLegacyPortKeys(nodes []NodeConfig, saved map[string]uint16) {
+	// Prefer the exact retained URI before considering aliases for removed or
+	// renamed duplicate entries in an older sidecar.
 	for i := range nodes {
 		stableKey := nodes[i].NodeKey()
-		if _, ok := saved[stableKey]; ok {
+		if saved[stableKey] > 0 {
 			continue
 		}
 		legacyKey := strings.TrimSpace(nodes[i].URI)
-		if port, ok := saved[legacyKey]; ok && port > 0 {
-			saved[stableKey] = port
+		keys := []string{legacyKey}
+		if index := strings.LastIndex(legacyKey, "#"); index != -1 {
+			keys = append(keys, legacyKey[:index])
+		}
+		for _, key := range keys {
+			if port := saved[key]; port > 0 {
+				saved[stableKey] = port
+				break
+			}
+		}
+	}
+	keys := make([]string, 0, len(saved))
+	for key := range saved {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys) // deterministic if legacy aliases share one identity
+	for _, legacyKey := range keys {
+		stableKey := stableNodeKey(legacyKey)
+		if _, exists := saved[stableKey]; !exists && saved[legacyKey] > 0 {
+			saved[stableKey] = saved[legacyKey]
 		}
 	}
 }
@@ -619,12 +702,12 @@ func (c *Config) SaveNodePortMap() error {
 // every node on the proxy port it previously used, then rewrites the mapping so
 // the sidecar exists from first boot and drops entries for removed nodes.
 //
-// It clears the provisional ports assigned by normalize() first, making
+// It clears only the provisional ports assigned by normalize() first, making
 // NormalizeWithPortMap the single, collision-safe authority: nodes whose stable
 // identity matches a saved entry get their saved port, and the rest get fresh,
-// non-conflicting ports. A corrupt or missing sidecar simply means "no saved
-// ports" and the freshly assigned ports stand.
-func (c *Config) applyPersistedPorts() error {
+// non-conflicting ports. Explicit inline ports take precedence over that node's
+// old saved assignment. A corrupt or missing sidecar means "no saved ports".
+func (c *Config) applyPersistedPorts(explicitPorts []bool) error {
 	if c.Mode != "multi-port" && c.Mode != "hybrid" {
 		return nil
 	}
@@ -640,7 +723,11 @@ func (c *Config) applyPersistedPorts() error {
 		bridgeLegacyPortKeys(c.Nodes, saved)
 	}
 	for i := range c.Nodes {
-		c.Nodes[i].Port = 0
+		if i < len(explicitPorts) && explicitPorts[i] {
+			delete(saved, c.Nodes[i].NodeKey())
+		} else {
+			c.Nodes[i].Port = 0
+		}
 	}
 	if err := c.NormalizeWithPortMap(saved); err != nil {
 		return fmt.Errorf("restore persisted ports: %w", err)
@@ -674,8 +761,10 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.Listener.Port == 0 {
 		c.Listener.Port = 2323
 	}
-	if c.Pool.Mode == "" {
-		c.Pool.Mode = "sequential"
+	if mode, err := normalizePoolMode(c.Pool.Mode); err != nil {
+		return err
+	} else {
+		c.Pool.Mode = mode
 	}
 	if c.Pool.FailureThreshold <= 0 {
 		c.Pool.FailureThreshold = 3
@@ -730,10 +819,8 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	}
 
 	// Build set of ports already assigned from portMap
-	usedPorts := make(map[uint16]bool)
-	if c.Mode == "hybrid" {
-		usedPorts[c.Listener.Port] = true
-	}
+	usedPorts := c.reservedListenerPorts()
+	preservedNodePorts := make([]bool, len(c.Nodes))
 
 	// First pass: assign ports from portMap for existing nodes
 	preservedPorts := 0
@@ -763,23 +850,43 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			nodeKey := c.Nodes[idx].NodeKey()
 			if existingPort, ok := portMap[nodeKey]; ok && existingPort > 0 {
 				if usedPorts[existingPort] {
+					c.Nodes[idx].Port = 0
 					duplicatePortHits++
 				} else {
 					c.Nodes[idx].Port = existingPort
 					usedPorts[existingPort] = true
+					preservedNodePorts[idx] = true
 					preservedPorts++
 				}
 			}
 		}
 	}
+	// Reserve every saved assignment before accepting new explicit ports. A new
+	// node appearing earlier in a subscription must not steal an existing node's
+	// stable port; reject the conflict regardless of input order instead.
+	if c.Mode == "multi-port" || c.Mode == "hybrid" {
+		for idx := range c.Nodes {
+			if preservedNodePorts[idx] || c.Nodes[idx].Port == 0 {
+				continue
+			}
+			if usedPorts[c.Nodes[idx].Port] {
+				return fmt.Errorf("node %q port %d conflicts with another listener", c.Nodes[idx].Name, c.Nodes[idx].Port)
+			}
+			usedPorts[c.Nodes[idx].Port] = true
+		}
+	}
 
-	// Second pass: assign new ports for nodes without preserved ports. portCursor
+	// Final pass: assign new ports for nodes without preserved ports. portCursor
 	// is an int (not uint16) so the >65535 exhaustion guard actually fires:
 	// a uint16 cursor would wrap to 0 and silently hand out unbindable low ports.
 	portCursor := int(c.MultiPort.BasePort)
 	newPorts := 0
 	for idx := range c.Nodes {
 		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
+			// Check before conversion: 65536 must not wrap to an ephemeral port.
+			if portCursor > 65535 {
+				return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+			}
 			// Find next available port that's not used
 			for usedPorts[uint16(portCursor)] || !IsPortAvailable(c.MultiPort.Address, uint16(portCursor)) {
 				portCursor++
@@ -791,7 +898,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			usedPorts[uint16(portCursor)] = true
 			newPorts++
 			portCursor++
-		} else if c.Nodes[idx].Port == 0 {
+		} else if c.Nodes[idx].Port == 0 && portCursor <= 65535 {
 			c.Nodes[idx].Port = uint16(portCursor)
 			portCursor++
 		}
@@ -826,6 +933,14 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 // Sticky sessions only apply to the shared pool entry, so they are disabled
 // outside pool/hybrid mode. Must run after node ports are assigned.
 func (c *Config) normalizeSticky() error {
+	if c.Sticky.SessionTTL < 0 || c.Sticky.SessionTTL > MaxSessionTTL {
+		return fmt.Errorf("sticky.session_ttl must be positive and at most %s", MaxSessionTTL)
+	}
+	if c.Sticky.MaxSessions < 0 || c.Sticky.MaxSessions > MaxSessionCapacity {
+		return fmt.Errorf("sticky.max_sessions must be between 1 and %d", MaxSessionCapacity)
+	}
+	c.Sticky.SessionTTL = c.Sticky.SessionTTLOrDefault()
+	c.Sticky.MaxSessions = c.Sticky.MaxSessionsOrDefault()
 	if !c.Sticky.Enabled {
 		return nil
 	}
@@ -898,7 +1013,7 @@ func (c *Config) ProbeConcurrencyOrDefault() int {
 // loadNodesFromFile reads a nodes file where each line is a proxy URI
 // Lines starting with # are comments, empty lines are ignored
 func loadNodesFromFile(path string) ([]NodeConfig, error) {
-	data, err := os.ReadFile(path)
+	data, err := readFileWithLock(path)
 	if err != nil {
 		return nil, err
 	}
@@ -1218,18 +1333,10 @@ func parseSubscriptionContent(content string) ([]NodeConfig, error) {
 		return parseClashYAML(content)
 	}
 
-	// Check if it's base64 encoded (common for v2ray subscriptions)
 	if isBase64(content) {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			// Try URL-safe base64
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-			if err != nil {
-				// Not base64, try as plain text
-				return parseNodesFromContent(content)
-			}
+		if decoded, err := decodeProxyBase64(content); err == nil {
+			content = string(decoded)
 		}
-		content = string(decoded)
 	}
 
 	// Parse as plain text (one URI per line)
@@ -1269,7 +1376,7 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 // isBase64 checks if a string looks like base64 encoded content (optimized version)
 func isBase64(s string) bool {
 	// Remove whitespace
-	s = strings.TrimSpace(s)
+	s = strings.Join(strings.Fields(s), "")
 	if len(s) == 0 {
 		return false
 	}
@@ -1287,13 +1394,13 @@ func isBase64(s string) bool {
 	// This is much faster than trying to decode
 	for _, c := range s {
 		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-			(c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') {
+			(c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' || c == '-' || c == '_') {
 			return false
 		}
 	}
 
 	// Length must be multiple of 4 (with padding)
-	return len(s)%4 == 0
+	return len(s)%4 != 1
 }
 
 // IsProxyURI checks if a string is a valid proxy URI
@@ -1485,8 +1592,19 @@ func buildHTTPProxyURI(p clashProxy) string {
 	return u.String()
 }
 
+func clashNodeURI(scheme string, p clashProxy, port int, user *url.Userinfo, params url.Values) string {
+	u := url.URL{Scheme: scheme, Host: net.JoinHostPort(p.Server, strconv.Itoa(port)), User: user, RawQuery: params.Encode(), Fragment: p.Name}
+	return u.String()
+}
+
 func buildVMessURI(p clashProxy) string {
 	params := url.Values{}
+	if p.AlterId != 0 {
+		params.Set("alterId", strconv.Itoa(p.AlterId))
+	}
+	if p.Cipher != "" {
+		params.Set("encryption", p.Cipher)
+	}
 	if p.Network != "" && p.Network != "tcp" {
 		params.Set("type", p.Network)
 	}
@@ -1513,12 +1631,7 @@ func buildVMessURI(p clashProxy) string {
 		params.Set("fp", p.ClientFingerprint)
 	}
 
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
-	return fmt.Sprintf("vmess://%s@%s:%d%s#%s", p.UUID, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+	return clashNodeURI("vmess", p, int(p.Port), url.User(p.UUID), params)
 }
 
 func buildVLESSURI(p clashProxy) string {
@@ -1566,7 +1679,7 @@ func buildVLESSURI(p clashProxy) string {
 		params.Set("fp", p.ClientFingerprint)
 	}
 
-	return fmt.Sprintf("vless://%s@%s:%d?%s#%s", p.UUID, p.Server, int(p.Port), params.Encode(), url.QueryEscape(p.Name))
+	return clashNodeURI("vless", p, int(p.Port), url.User(p.UUID), params)
 }
 
 func buildTrojanURI(p clashProxy) string {
@@ -1597,12 +1710,7 @@ func buildTrojanURI(p clashProxy) string {
 		params.Set("fp", p.ClientFingerprint)
 	}
 
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
-	return fmt.Sprintf("trojan://%s@%s:%d%s#%s", p.Password, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+	return clashNodeURI("trojan", p, int(p.Port), url.User(p.Password), params)
 }
 
 func buildAnyTLSURI(p clashProxy) string {
@@ -1619,18 +1727,13 @@ func buildAnyTLSURI(p clashProxy) string {
 		params.Set("fp", p.ClientFingerprint)
 	}
 
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
-	return fmt.Sprintf("anytls://%s@%s:%d%s#%s", p.Password, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+	return clashNodeURI("anytls", p, int(p.Port), url.User(p.Password), params)
 }
 
 func buildShadowsocksURI(p clashProxy) string {
 	// Encode method:password in base64
-	userInfo := base64.StdEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
-	return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, p.Server, int(p.Port), url.QueryEscape(p.Name))
+	userInfo := base64.RawURLEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
+	return clashNodeURI("ss", p, int(p.Port), url.User(userInfo), nil)
 }
 
 func buildHysteria2URI(p clashProxy) string {
@@ -1653,17 +1756,12 @@ func buildHysteria2URI(p clashProxy) string {
 		params.Set("ports", normalizeHysteria2PortsValue(strings.TrimSpace(p.Ports)))
 	}
 
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
 	port := int(p.Port)
 	if port <= 0 {
 		port = 443
 	}
 
-	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, port, query, url.QueryEscape(p.Name))
+	return clashNodeURI("hysteria2", p, port, url.User(p.Password), params)
 }
 
 func normalizeHysteria2PortsValue(value string) string {
@@ -1713,13 +1811,8 @@ func buildTUICURI(p clashProxy) string {
 		params.Set("alpn", strings.Join(p.ALPN, ","))
 	}
 
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
 	// TUIC URI format: tuic://uuid:password@server:port?params#name
-	return fmt.Sprintf("tuic://%s:%s@%s:%d%s#%s", p.UUID, p.Password, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+	return clashNodeURI("tuic", p, int(p.Port), url.UserPassword(p.UUID, p.Password), params)
 }
 
 // buildShadowsocksRURI converts a Clash SSR proxy config to an SSR URI.
@@ -1795,7 +1888,7 @@ func buildHysteriaURI(p clashProxy) string {
 		}
 	}
 
-	return fmt.Sprintf("hysteria://%s:%d?%s#%s", p.Server, int(p.Port), params.Encode(), url.QueryEscape(p.Name))
+	return clashNodeURI("hysteria", p, int(p.Port), nil, params)
 }
 
 func defaultStr(s, fallback string) string {
@@ -1832,6 +1925,12 @@ func writeNodesToFile(path string, nodes []NodeConfig) error {
 	}
 	// Use file locking for safe concurrent writes
 	return writeFileWithLock(path, []byte(content), 0o644)
+}
+
+// WriteNodesToFile persists a complete subscription cache through the common
+// locked writer, without changing inline nodes or management settings.
+func WriteNodesToFile(path string, nodes []NodeConfig) error {
+	return writeNodesToFile(path, nodes)
 }
 
 // SaveNodes persists nodes to their appropriate locations based on source.
@@ -1891,30 +1990,10 @@ func (c *Config) SaveNodes() error {
 		log.Printf("✅ Saved %d nodes to %s", len(fileNodes), nodesFilePath)
 	}
 
-	// Update config.yaml nodes array (including clearing it when all inline nodes are deleted)
-	{
-		// Read original config to preserve structure
-		data, err := os.ReadFile(c.filePath)
-		if err != nil {
-			return fmt.Errorf("read config: %w", err)
-		}
-		var saveCfg Config
-		if err := yaml.Unmarshal(data, &saveCfg); err != nil {
-			return fmt.Errorf("decode config: %w", err)
-		}
-		// Update only the inline nodes
-		saveCfg.Nodes = inlineNodes
-
-		newData, err := yaml.Marshal(&saveCfg)
-		if err != nil {
-			return fmt.Errorf("encode config: %w", err)
-		}
-		// Use file locking for safe concurrent writes
-		if err := writeFileWithLock(c.filePath, newData, 0o644); err != nil {
-			return fmt.Errorf("write config: %w", err)
-		}
-		log.Printf("✅ Saved %d inline nodes to %s", len(inlineNodes), c.filePath)
+	if err := updateConfigFile(c.filePath, func(saved *Config) { saved.Nodes = inlineNodes }); err != nil {
+		return err
 	}
+	log.Printf("✅ Saved %d inline nodes to %s", len(inlineNodes), c.filePath)
 
 	return nil
 }
@@ -1925,9 +2004,45 @@ func (c *Config) Save() error {
 	return c.SaveNodes()
 }
 
-// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify)
+// SettingsSnapshot copies only fields owned by the management settings API.
+// The caller must synchronize settings access; runtime node/subscription fields
+// deliberately are not read or copied.
+func (c *Config) SettingsSnapshot() Config {
+	return Config{
+		Mode: c.Mode, Listener: c.Listener, MultiPort: c.MultiPort, Pool: c.Pool,
+		Sticky: c.Sticky, Management: c.Management, ExternalIP: c.ExternalIP,
+		SkipCertVerify: c.SkipCertVerify, Log: c.Log, GeoIP: c.GeoIP,
+		filePath: c.filePath,
+	}
+}
+
+// SaveManagementSettings leaves subscription and node data in the on-disk
+// configuration intact; they have separate management endpoints/lifecycles.
+func (c *Config) SaveManagementSettings() error {
+	if err := c.ValidateManagementSettings(); err != nil {
+		return err
+	}
+	return c.saveSettings(false)
+}
+
+// SaveSubscriptionSettings updates only subscription ownership fields.
+func (c *Config) SaveSubscriptionSettings() error {
+	if c == nil || c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+	return updateConfigFile(c.filePath, func(saved *Config) {
+		saved.Subscriptions = append([]string(nil), c.Subscriptions...)
+		saved.SubscriptionRefresh = c.SubscriptionRefresh
+	})
+}
+
+// SaveSettings persists config settings and subscription configuration
 // without touching nodes.txt. Use this for settings API updates.
 func (c *Config) SaveSettings() error {
+	return c.saveSettings(true)
+}
+
+func (c *Config) saveSettings(includeSubscriptions bool) error {
 	if c == nil {
 		return errors.New("config is nil")
 	}
@@ -1935,43 +2050,27 @@ func (c *Config) SaveSettings() error {
 		return errors.New("config file path is unknown")
 	}
 
-	data, err := os.ReadFile(c.filePath)
-	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-	var saveCfg Config
-	if err := yaml.Unmarshal(data, &saveCfg); err != nil {
-		return fmt.Errorf("decode config: %w", err)
-	}
-
-	saveCfg.ExternalIP = c.ExternalIP
-	saveCfg.Management.ProbeTarget = c.Management.ProbeTarget
-	saveCfg.SkipCertVerify = c.SkipCertVerify
-	saveCfg.Log = c.Log
-	saveCfg.Subscriptions = c.Subscriptions
-	saveCfg.SubscriptionRefresh = c.SubscriptionRefresh
-	saveCfg.GeoIP = c.GeoIP
-	saveCfg.Mode = c.Mode
-	saveCfg.Listener = c.Listener
-	saveCfg.MultiPort = c.MultiPort
-	saveCfg.Pool = c.Pool
-	saveCfg.Management = c.Management
-
-	newData, err := yaml.Marshal(&saveCfg)
-	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
-	}
-
-	// Use file locking for safe concurrent writes
-	if err := writeFileWithLock(c.filePath, newData, 0o644); err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-	return nil
+	return updateConfigFile(c.filePath, func(saveCfg *Config) {
+		saveCfg.ExternalIP = c.ExternalIP
+		saveCfg.SkipCertVerify = c.SkipCertVerify
+		saveCfg.Log = c.Log
+		if includeSubscriptions {
+			saveCfg.Subscriptions = append([]string(nil), c.Subscriptions...)
+			saveCfg.SubscriptionRefresh = c.SubscriptionRefresh
+		}
+		saveCfg.GeoIP = c.GeoIP
+		saveCfg.Mode = c.Mode
+		saveCfg.Listener = c.Listener
+		saveCfg.MultiPort = c.MultiPort
+		saveCfg.Pool = c.Pool
+		saveCfg.Sticky = c.Sticky
+		saveCfg.Management = c.Management
+	})
 }
 
 // IsPortAvailable checks if a port is available for binding.
 func IsPortAvailable(address string, port uint16) bool {
-	addr := fmt.Sprintf("%s:%d", address, port)
+	addr := net.JoinHostPort(address, strconv.Itoa(int(port)))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return false
@@ -1992,7 +2091,7 @@ func checkFileWritable(path string) error {
 	info, err := os.Stat(path)
 	if err == nil {
 		// File exists, check if writable
-		if info.Mode().Perm()&0o200 == 0 {
+		if info.Mode().Perm()&0o222 == 0 {
 			return fmt.Errorf("file %q is read-only (mode: %s)", path, info.Mode())
 		}
 		// Try to open for writing
@@ -2009,39 +2108,11 @@ func checkFileWritable(path string) error {
 	}
 
 	// File doesn't exist, check if directory is writable
-	testFile := filepath.Join(dir, ".write_test")
-	f, err := os.Create(testFile)
+	f, err := os.CreateTemp(dir, ".easy-proxies-permission-*")
 	if err != nil {
 		return fmt.Errorf("directory %q is not writable: %w", dir, err)
 	}
 	f.Close()
-	os.Remove(testFile)
-	return nil
-}
-
-// writeFileWithLock writes data to a file with exclusive locking.
-func writeFileWithLock(path string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return fmt.Errorf("open file: %w", err)
-	}
-	defer f.Close()
-
-	// Acquire exclusive lock
-	if err := lockFile(f); err != nil {
-		return fmt.Errorf("lock file: %w", err)
-	}
-	defer unlockFile(f)
-
-	// Write data
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("write file: %w", err)
-	}
-
-	// Ensure data is written to disk
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync file: %w", err)
-	}
-
+	os.Remove(f.Name())
 	return nil
 }

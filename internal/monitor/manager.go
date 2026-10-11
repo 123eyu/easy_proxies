@@ -71,6 +71,15 @@ type Snapshot struct {
 type probeFunc func(ctx context.Context) (time.Duration, error)
 type releaseFunc func()
 
+// probeRun coalesces callers for one node. A protocol dial that ignores context
+// can retain at most one callback goroutine per entry, not one per HTTP request.
+type probeRun struct {
+	done       chan struct{}
+	latency    time.Duration
+	err        error
+	generation uint64
+}
+
 type EntryHandle struct {
 	ref *entry
 }
@@ -88,6 +97,8 @@ type entry struct {
 	lastProbe        time.Duration
 	active           atomic.Int32
 	probe            probeFunc
+	probeRun         *probeRun
+	probeGeneration  uint64
 	release          releaseFunc
 	blacklistFn      func(time.Duration)
 	initialCheckDone bool
@@ -214,7 +225,9 @@ func NewManager(cfg Config) (*Manager, error) {
 
 // SetLogger sets the logger for the manager.
 func (m *Manager) SetLogger(logger Logger) {
+	m.mu.Lock()
 	m.logger = logger
+	m.mu.Unlock()
 }
 
 // SetProbeConcurrency updates the worker limit used by periodic health checks.
@@ -249,13 +262,16 @@ func (m *Manager) SetProbeTarget(probeTarget string, skipCertVerify bool) {
 // interval: how often to check (e.g., 30 * time.Second)
 // timeout: timeout for each probe (e.g., 10 * time.Second)
 func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
-	if !m.probeReady {
+	m.mu.RLock()
+	probeReady, logger := m.probeReady, m.logger
+	m.mu.RUnlock()
+	if !probeReady {
 		// No probe target configured: nodes cannot be verified. Run probeAllNodes
 		// once so it marks every node initialCheckDone+available via its nil-probe
 		// branch — otherwise nodes stay initialCheckDone=false forever and both the
 		// export and the "healthy online" count read zero. Do not start the ticker.
-		if m.logger != nil {
-			m.logger.Warn("probe target not configured, marking all nodes available without verification")
+		if logger != nil {
+			logger.Warn("probe target not configured, marking all nodes available without verification")
 		}
 		m.probeAllNodes(timeout)
 		return
@@ -278,8 +294,8 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 		}
 	}()
 
-	if m.logger != nil {
-		m.logger.Info("periodic health check started, interval: ", interval)
+	if logger != nil {
+		logger.Info("periodic health check started, interval: ", interval)
 	}
 }
 
@@ -295,6 +311,9 @@ func (m *Manager) ProbeAllNow(timeout time.Duration) {
 // sweeps that would corrupt the shared progress counters and wedge the WebUI
 // progress bar "active" flag on.
 func (m *Manager) probeAllNodes(timeout time.Duration) {
+	if m.ctx.Err() != nil {
+		return
+	}
 	m.probeGate.Lock()
 	if m.sweepRunning {
 		// A sweep is running: request one follow-up pass and return. The running
@@ -310,11 +329,12 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		m.runProbeSweep(timeout)
 
 		m.probeGate.Lock()
-		if m.rerunRequested {
+		if m.rerunRequested && m.ctx.Err() == nil {
 			m.rerunRequested = false
 			m.probeGate.Unlock()
 			continue // A trigger arrived mid-sweep; run exactly one more pass.
 		}
+		m.rerunRequested = false
 		m.sweepRunning = false
 		m.probeGate.Unlock()
 		return
@@ -325,7 +345,11 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 // invoked by probeAllNodes, which guarantees single-flight execution, so the
 // shared probeSweep* progress counters are never written by two sweeps at once.
 func (m *Manager) runProbeSweep(timeout time.Duration) {
+	if m.ctx.Err() != nil {
+		return
+	}
 	m.mu.RLock()
+	logger := m.logger
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
 		entries = append(entries, e)
@@ -336,8 +360,8 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 		return
 	}
 
-	if m.logger != nil {
-		m.logger.Info("starting health check for ", len(entries), " nodes")
+	if logger != nil {
+		logger.Info("starting health check for ", len(entries), " nodes")
 	}
 
 	// Publish sweep progress for the WebUI. Reset counters, mark active, and
@@ -376,78 +400,58 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 			e.initialCheckDone = true
 			e.available = true
 			e.mu.Unlock()
+			availableCount.Add(1)
 			m.probeSweepOK.Add(1)
 			m.probeSweepDone.Add(1)
 			continue
 		}
 
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-m.ctx.Done():
+			wg.Wait()
+			return
+		}
 		wg.Add(1)
-		go func(entry *entry, probe probeFunc, tag string) {
+		go func(entry *entry, tag string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
 			ctx, cancel := context.WithTimeout(m.ctx, timeout)
 			defer cancel()
 
-			// Race the probe against its deadline. Some sing-box protocol dials
-			// block inside DialContext without honoring ctx, so a direct
-			// probe(ctx) call could never return — wedging this worker's
-			// semaphore slot and hanging the whole sweep (wg.Wait never returns;
-			// the dashboard shows a stuck init and 0 available even though the
-			// nodes are reachable). Run the probe in its own goroutine and select
-			// on ctx.Done() so the worker always returns within timeout. The
-			// buffered channel lets the stalled goroutine deliver its result
-			// later (its connection watchdog force-closes on ctx.Done) without
-			// blocking on send.
-			type probeOutcome struct {
-				latency time.Duration
-				err     error
-			}
-			resCh := make(chan probeOutcome, 1)
-			go func() {
-				latency, err := probe(ctx)
-				resCh <- probeOutcome{latency: latency, err: err}
-			}()
-
-			var latency time.Duration
-			var err error
-			select {
-			case out := <-resCh:
-				latency, err = out.latency, out.err
-			case <-ctx.Done():
-				err = ctx.Err()
+			latency, err, authoritative, generation := entry.waitProbe(ctx)
+			// Shutdown/client cancellation says nothing about a node's health.
+			if !authoritative || errors.Is(err, context.Canceled) {
+				m.probeSweepDone.Add(1)
+				return
 			}
 
-			entry.mu.Lock()
-			uri := entry.info.URI
+			if !entry.applyProbeResult(generation, latency, err) {
+				m.probeSweepDone.Add(1)
+				return
+			}
 			if err != nil {
 				failedCount.Add(1)
 				m.probeSweepFail.Add(1)
-				entry.lastError = err.Error()
-				entry.lastFail = time.Now()
-				entry.available = false
-				entry.initialCheckDone = true
 			} else {
 				availableCount.Add(1)
 				m.probeSweepOK.Add(1)
-				entry.lastOK = time.Now()
-				entry.lastProbe = latency
-				entry.available = true
-				entry.initialCheckDone = true
 			}
-			entry.mu.Unlock()
 			m.probeSweepDone.Add(1)
 
-			if err != nil && m.logger != nil {
-				m.logger.Warn("probe failed: ", FormatProbeFailure(tag, uri, err))
+			if err != nil && logger != nil {
+				entry.mu.RLock()
+				uri := entry.info.URI
+				entry.mu.RUnlock()
+				logger.Warn("probe failed: ", FormatProbeFailure(tag, uri, err))
 			}
-		}(e, probeFn, tag)
+		}(e, tag)
 	}
 	wg.Wait()
 
-	if m.logger != nil {
-		m.logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
+	if logger != nil {
+		logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
 	}
 }
 
@@ -478,7 +482,9 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		}
 		m.nodes[info.Tag] = e
 	} else {
+		e.mu.Lock()
 		e.info = info
+		e.mu.Unlock()
 	}
 	return &EntryHandle{ref: e}
 }
@@ -539,6 +545,9 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 		latencyJ := snapshots[j].LastLatencyMs
 		// -1 表示未测试，排在最后
 		if latencyI < 0 && latencyJ < 0 {
+			if snapshots[i].Name == snapshots[j].Name {
+				return snapshots[i].Tag < snapshots[j].Tag
+			}
 			return snapshots[i].Name < snapshots[j].Name // 都未测试时按名称排序
 		}
 		if latencyI < 0 {
@@ -548,6 +557,9 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 			return true // j 未测试，i 排在前面
 		}
 		if latencyI == latencyJ {
+			if snapshots[i].Name == snapshots[j].Name {
+				return snapshots[i].Tag < snapshots[j].Tag
+			}
 			return snapshots[i].Name < snapshots[j].Name // 延迟相同时按名称排序
 		}
 		return latencyI < latencyJ
@@ -565,38 +577,40 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 	if err != nil {
 		return 0, err
 	}
-	if e.probe == nil {
-		return 0, errors.New("probe not available for this node")
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Every manual caller is bounded, even when used outside the HTTP API.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+	}
+	probeCtx, probeCancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(m.ctx, probeCancel)
+	defer stop()
+	defer probeCancel()
+	latency, err, authoritative, generation := e.waitProbe(probeCtx)
+	if !authoritative || errors.Is(err, context.Canceled) || errors.Is(err, errProbeUnavailable) {
+		return 0, err
 	}
 
-	// Enforce the context deadline at this level. Some sing-box outbound
-	// protocols block inside DialContext without honoring ctx cancellation, so a
-	// probe could otherwise never return — which in batch mode occupies a
-	// semaphore slot forever and freezes the whole run (wg.Wait never returns,
-	// WebUI stuck at "N/M"). Run the probe in its own goroutine and race it
-	// against ctx: if ctx fires first we return a timeout error and let the
-	// stuck goroutine unwind on its own (its conn watchdog force-closes on
-	// ctx.Done). The result channel is buffered so that late goroutine never
-	// blocks on send.
-	type probeOutcome struct {
-		latency time.Duration
-		err     error
-	}
-	resCh := make(chan probeOutcome, 1)
-	go func() {
-		latency, err := e.probe(ctx)
-		resCh <- probeOutcome{latency: latency, err: err}
-	}()
+	e.applyProbeResult(generation, latency, err)
 
-	var latency time.Duration
-	select {
-	case out := <-resCh:
-		latency, err = out.latency, out.err
-	case <-ctx.Done():
-		err = ctx.Err()
+	if err != nil {
+		return 0, err
 	}
+	return latency, nil
+}
 
+// A completed run can have several waiting callers. A late caller from a
+// previous run must not overwrite the health result of a newer run.
+func (e *entry) applyProbeResult(generation uint64, latency time.Duration, err error) bool {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if generation != e.probeGeneration {
+		return false
+	}
 	e.initialCheckDone = true
 	if err != nil {
 		e.lastError = err.Error()
@@ -604,14 +618,51 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 		e.available = false
 	} else {
 		e.lastOK = time.Now()
+		e.lastError = ""
 		e.lastProbe = latency
 		e.available = true
 	}
-	e.mu.Unlock()
-	if err != nil {
-		return 0, err
+	return true
+}
+
+var errProbeUnavailable = errors.New("probe not available for this node")
+
+func (e *entry) waitProbe(ctx context.Context) (time.Duration, error, bool, uint64) {
+	if err := ctx.Err(); err != nil {
+		return 0, err, false, 0
 	}
-	return latency, nil
+	e.mu.Lock()
+	if e.probe == nil {
+		e.mu.Unlock()
+		return 0, errProbeUnavailable, false, 0
+	}
+	run := e.probeRun
+	started := run == nil
+	if run == nil {
+		e.probeGeneration++
+		run = &probeRun{done: make(chan struct{}), generation: e.probeGeneration}
+		e.probeRun = run
+		probe := e.probe
+		go func() {
+			run.latency, run.err = probe(ctx)
+			e.mu.Lock()
+			if e.probeRun == run {
+				e.probeRun = nil
+			}
+			close(run.done)
+			e.mu.Unlock()
+		}()
+	}
+	e.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err(), started, run.generation
+	case <-run.done:
+		if err := ctx.Err(); err != nil {
+			return 0, err, started, run.generation
+		}
+		return run.latency, run.err, true, run.generation
+	}
 }
 
 // Release clears blacklist state for the given node.
@@ -620,10 +671,13 @@ func (m *Manager) Release(tag string) error {
 	if err != nil {
 		return err
 	}
-	if e.release == nil {
+	e.mu.RLock()
+	release := e.release
+	e.mu.RUnlock()
+	if release == nil {
 		return errors.New("release not available for this node")
 	}
-	e.release()
+	release()
 	return nil
 }
 
@@ -678,7 +732,7 @@ func (e *entry) snapshot() Snapshot {
 		NodeInfo:          e.info,
 		FailureCount:      e.failure,
 		SuccessCount:      e.success,
-		Blacklisted:       e.blacklist,
+		Blacklisted:       e.blacklist && (e.until.IsZero() || time.Now().Before(e.until)),
 		BlacklistedUntil:  e.until,
 		ActiveConnections: e.active.Load(),
 		LastError:         e.lastError,
@@ -707,6 +761,7 @@ func (e *entry) recordSuccess() {
 	defer e.mu.Unlock()
 	e.success++
 	e.lastOK = time.Now()
+	e.lastError = ""
 	e.appendTimelineLocked(true, 0, "")
 }
 
@@ -715,6 +770,7 @@ func (e *entry) recordSuccessWithLatency(latency time.Duration) {
 	defer e.mu.Unlock()
 	e.success++
 	e.lastOK = time.Now()
+	e.lastError = ""
 	e.lastProbe = latency
 	latencyMs := latency.Milliseconds()
 	if latencyMs == 0 && latency > 0 {

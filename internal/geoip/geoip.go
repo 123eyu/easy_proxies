@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"easy_proxies/internal/ssuri"
 
 	"github.com/oschwald/geoip2-golang"
+	"golang.org/x/sync/singleflight"
 )
 
 // Region codes
@@ -35,7 +37,8 @@ const (
 
 // Default GeoIP database download URL
 const (
-	DefaultGeoIPURL = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
+	DefaultGeoIPURL        = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
+	maxDatabaseBytes int64 = 64 << 20
 )
 
 // RegionInfo contains region details
@@ -52,9 +55,32 @@ type Lookup struct {
 	path           string
 	updateInterval time.Duration
 	stopChan       chan struct{}
+	updateDone     chan struct{}
 	updateOnce     sync.Once
-	dnsCache       map[string]RegionInfo
+	dnsCache       map[string]cachedRegion
 	cacheMu        sync.RWMutex
+	cacheEpoch     uint64
+	updateMu       sync.Mutex
+	ctx            context.Context
+	cancel         context.CancelFunc
+	closed         bool
+	dnsGroup       singleflight.Group
+	resolveHost    func(context.Context, string) ([]net.IPAddr, error)
+}
+
+type cachedRegion struct {
+	info      RegionInfo
+	expiresAt time.Time
+}
+
+const (
+	dnsCacheTTL         = 15 * time.Minute
+	dnsNegativeCacheTTL = time.Minute
+	maxDNSCacheEntries  = 4096
+)
+
+func unknownRegion() RegionInfo {
+	return RegionInfo{Code: RegionOther, Country: "Unknown"}
 }
 
 // EnsureDatabase checks if the GeoIP database exists, and downloads it if not
@@ -78,79 +104,9 @@ func EnsureDatabase(dbPath string) error {
 
 	log.Printf("📥 GeoIP database not found at %s, downloading...", dbPath)
 
-	// Create parent directory if needed
-	dir := filepath.Dir(dbPath)
-	if dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("create directory: %w", err)
-		}
+	if err := downloadDatabase(dbPath); err != nil {
+		return err
 	}
-
-	// Download with timeout
-	client := &http.Client{Timeout: 60 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, DefaultGeoIPURL, nil)
-	if err != nil {
-		return fmt.Errorf("create download request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: unexpected status %s", resp.Status)
-	}
-
-	// Download to temporary file
-	tempFile, err := os.CreateTemp(dir, ".geoip-*.mmdb")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tempPath := tempFile.Name()
-	cleanup := true
-	defer func() {
-		if tempFile != nil {
-			tempFile.Close()
-		}
-		if cleanup {
-			os.Remove(tempPath)
-		}
-	}()
-
-	// Copy with progress tracking
-	progress := &progressWriter{total: resp.ContentLength}
-	reader := io.TeeReader(resp.Body, progress)
-	written, err := io.Copy(tempFile, reader)
-	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
-	}
-
-	// Verify download completeness
-	if resp.ContentLength > 0 && written < resp.ContentLength {
-		return fmt.Errorf("incomplete download (%d/%d bytes)", written, resp.ContentLength)
-	}
-
-	// Sync and close temp file
-	if err := tempFile.Sync(); err != nil {
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-	if err := tempFile.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-	tempFile = nil
-
-	// Validate MMDB format
-	if err := validateMMDB(tempPath); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tempPath, dbPath); err != nil {
-		return fmt.Errorf("rename failed: %w", err)
-	}
-	cleanup = false
 
 	log.Printf("✅ GeoIP database downloaded successfully to %s", dbPath)
 	return nil
@@ -216,8 +172,13 @@ func validateMMDB(path string) error {
 	if !bytes.Contains(buf, []byte("MaxMind.com")) {
 		return fmt.Errorf("missing MaxMind metadata")
 	}
-
-	return nil
+	// A metadata marker alone is not sufficient: reject damaged tree/data
+	// sections before replacing a working database.
+	db, err := geoip2.Open(path)
+	if err != nil {
+		return fmt.Errorf("invalid MMDB: %w", err)
+	}
+	return db.Close()
 }
 
 // New creates a new GeoIP lookup instance
@@ -227,31 +188,37 @@ func New(dbPath string) (*Lookup, error) {
 
 // NewWithAutoUpdate creates a new GeoIP lookup instance with auto-update support
 func NewWithAutoUpdate(dbPath string, updateInterval time.Duration) (*Lookup, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	lookup := &Lookup{
+		path: dbPath, updateInterval: updateInterval,
+		stopChan: make(chan struct{}), dnsCache: make(map[string]cachedRegion),
+		ctx: ctx, cancel: cancel, resolveHost: net.DefaultResolver.LookupIPAddr,
+	}
 	if dbPath == "" {
-		return &Lookup{}, nil
+		return lookup, nil
 	}
 
 	// Ensure database exists (download if needed)
 	if err := EnsureDatabase(dbPath); err != nil {
+		cancel()
 		return nil, fmt.Errorf("ensure database: %w", err)
 	}
 
 	db, err := geoip2.Open(dbPath)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
-	lookup := &Lookup{
-		db:             db,
-		path:           dbPath,
-		updateInterval: updateInterval,
-		stopChan:       make(chan struct{}),
-		dnsCache:       make(map[string]RegionInfo),
-	}
+	lookup.db = db
 
 	// Start auto-update goroutine if interval is set
 	if updateInterval > 0 {
-		go lookup.autoUpdateLoop()
+		lookup.updateDone = make(chan struct{})
+		go func() {
+			defer close(lookup.updateDone)
+			lookup.autoUpdateLoop()
+		}()
 		log.Printf("🔄 GeoIP auto-update enabled (interval: %v)", updateInterval)
 	}
 
@@ -277,18 +244,36 @@ func (l *Lookup) autoUpdateLoop() {
 
 // Update downloads and reloads the GeoIP database
 func (l *Lookup) Update() error {
+	l.updateMu.Lock()
+	defer l.updateMu.Unlock()
+	l.mu.RLock()
+	closed, dbPath, ctx := l.closed, l.path, l.ctx
+	l.mu.RUnlock()
+	if closed {
+		return errors.New("GeoIP lookup is closed")
+	}
+	if dbPath == "" {
+		return errors.New("GeoIP database path is empty")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	log.Printf("🔄 Updating GeoIP database...")
 
-	// Download to temporary file
-	tempPath := l.path + ".update"
-	if err := downloadDatabase(tempPath); err != nil {
-		return fmt.Errorf("download failed: %w", err)
+	// Each updater owns its staging path, even when separate lookups use the
+	// same database file. Never overwrite another updater's mapped file.
+	temp, err := os.CreateTemp(filepath.Dir(dbPath), ".geoip-update-*.mmdb")
+	if err != nil {
+		return fmt.Errorf("create update temp file: %w", err)
 	}
-	defer os.Remove(tempPath) // Clean up temp file
-
-	// Validate the downloaded database
-	if err := validateMMDB(tempPath); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
+	tempPath := temp.Name()
+	temp.Close()
+	defer os.Remove(tempPath)
+	if err := downloadDatabaseContext(ctx, tempPath); err != nil {
+		return fmt.Errorf("download failed: %w", err)
 	}
 
 	// Open new database
@@ -299,18 +284,29 @@ func (l *Lookup) Update() error {
 
 	// Hot-swap the database
 	l.mu.Lock()
+	if l.closed || ctx.Err() != nil {
+		l.mu.Unlock()
+		newDB.Close()
+		return errors.New("GeoIP lookup is closed")
+	}
+	// Publish only after the on-disk replacement succeeds. Otherwise retain
+	// the old reader and report the failed update to its caller.
+	if err := os.Rename(tempPath, dbPath); err != nil {
+		l.mu.Unlock()
+		newDB.Close()
+		return fmt.Errorf("replace database file: %w", err)
+	}
 	oldDB := l.db
 	l.db = newDB
+	l.cacheMu.Lock()
+	l.cacheEpoch++
+	l.dnsCache = make(map[string]cachedRegion)
+	l.cacheMu.Unlock()
 	l.mu.Unlock()
 
 	// Close old database
 	if oldDB != nil {
 		oldDB.Close()
-	}
-
-	// Replace the old file with new one
-	if err := os.Rename(tempPath, l.path); err != nil {
-		log.Printf("⚠️  Failed to replace database file: %v (using in-memory version)", err)
 	}
 
 	log.Printf("✅ GeoIP database updated successfully")
@@ -319,6 +315,10 @@ func (l *Lookup) Update() error {
 
 // downloadDatabase downloads the GeoIP database to the specified path
 func downloadDatabase(dbPath string) error {
+	return downloadDatabaseContext(context.Background(), dbPath)
+}
+
+func downloadDatabaseContext(ctx context.Context, dbPath string) error {
 	// Create parent directory if needed
 	dir := filepath.Dir(dbPath)
 	if dir != "" && dir != "." {
@@ -329,7 +329,7 @@ func downloadDatabase(dbPath string) error {
 
 	// Download with timeout
 	client := &http.Client{Timeout: 60 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, DefaultGeoIPURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, DefaultGeoIPURL, nil)
 	if err != nil {
 		return fmt.Errorf("create download request: %w", err)
 	}
@@ -342,6 +342,9 @@ func downloadDatabase(dbPath string) error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status %s", resp.Status)
+	}
+	if resp.ContentLength > maxDatabaseBytes {
+		return fmt.Errorf("GeoIP database exceeds %d-byte download limit", maxDatabaseBytes)
 	}
 
 	// Create temp file
@@ -362,10 +365,13 @@ func downloadDatabase(dbPath string) error {
 
 	// Copy with progress tracking
 	progress := &progressWriter{total: resp.ContentLength}
-	reader := io.TeeReader(resp.Body, progress)
+	reader := io.TeeReader(io.LimitReader(resp.Body, maxDatabaseBytes+1), progress)
 	written, err := io.Copy(tempFile, reader)
 	if err != nil {
 		return err
+	}
+	if written > maxDatabaseBytes {
+		return fmt.Errorf("GeoIP database exceeds %d-byte download limit", maxDatabaseBytes)
 	}
 
 	// Verify download completeness
@@ -381,6 +387,9 @@ func downloadDatabase(dbPath string) error {
 		return err
 	}
 	tempFile = nil
+	if err := validateMMDB(tempPath); err != nil {
+		return fmt.Errorf("validation failed: %w", err)
+	}
 
 	// Rename to target path
 	if err := os.Rename(tempPath, dbPath); err != nil {
@@ -395,17 +404,31 @@ func downloadDatabase(dbPath string) error {
 func (l *Lookup) Close() error {
 	// Stop auto-update goroutine
 	l.updateOnce.Do(func() {
+		if l.cancel != nil {
+			l.cancel()
+		}
 		if l.stopChan != nil {
 			close(l.stopChan)
 		}
 	})
 
+	// Cancellation interrupts an in-flight download before waiting for the
+	// updater, preventing it from reviving the reader after Close returns.
+	l.updateMu.Lock()
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.closed = true
+	var err error
 	if l.db != nil {
-		return l.db.Close()
+		db := l.db
+		l.db = nil
+		err = db.Close()
 	}
-	return nil
+	l.mu.Unlock()
+	l.updateMu.Unlock()
+	if l.updateDone != nil {
+		<-l.updateDone
+	}
+	return err
 }
 
 // IsEnabled returns true if GeoIP lookup is available
@@ -449,46 +472,88 @@ func (l *Lookup) LookupIP(ipStr string) RegionInfo {
 
 // LookupURI extracts server from URI and returns region info
 func (l *Lookup) LookupURI(uri string) RegionInfo {
+	// Disabled/closed lookup never attempts DNS or writes to an uninitialized
+	// cache. The zero value is intentionally usable too.
+	if !l.IsEnabled() {
+		return unknownRegion()
+	}
 	host := extractHostFromURI(uri)
 	if host == "" {
-		return RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
+		return unknownRegion()
 	}
-
-	// Check DNS cache first
-	l.cacheMu.RLock()
-	if cached, ok := l.dnsCache[host]; ok {
-		l.cacheMu.RUnlock()
+	host = strings.ToLower(host)
+	if cached, ok := l.cachedHost(host); ok {
 		return cached
 	}
-	l.cacheMu.RUnlock()
-
-	// Resolve hostname to IP if needed
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// It's a hostname, try to resolve with timeout
-		resolver := &net.Resolver{}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		ips, err := resolver.LookupIPAddr(ctx, host)
-		if err != nil || len(ips) == 0 {
-			result := RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
-			// Cache failed lookups too to avoid repeated timeouts
-			l.cacheMu.Lock()
-			l.dnsCache[host] = result
-			l.cacheMu.Unlock()
-			return result
+	// Node subscriptions commonly repeat one hostname hundreds of times. A
+	// shared miss performs one DNS query, rather than one per build worker.
+	value, _, _ := l.dnsGroup.Do(host, func() (any, error) {
+		if cached, ok := l.cachedHost(host); ok {
+			return cached, nil
 		}
-		host = ips[0].IP.String()
-	}
+		l.cacheMu.RLock()
+		epoch := l.cacheEpoch
+		l.cacheMu.RUnlock()
+		address, ttl := host, dnsCacheTTL
+		if net.ParseIP(host) == nil {
+			parent := l.ctx
+			if parent == nil {
+				parent = context.Background()
+			}
+			ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+			defer cancel()
+			resolve := l.resolveHost
+			if resolve == nil {
+				resolve = net.DefaultResolver.LookupIPAddr
+			}
+			ips, err := resolve(ctx, host)
+			if err != nil || len(ips) == 0 {
+				result := unknownRegion()
+				l.cacheHostAtEpoch(host, result, dnsNegativeCacheTTL, epoch)
+				return result, nil
+			}
+			address = ips[0].IP.String()
+		}
+		result := l.LookupIP(address)
+		l.cacheHostAtEpoch(host, result, ttl, epoch)
+		return result, nil
+	})
+	return value.(RegionInfo)
+}
 
-	result := l.LookupIP(host)
+func (l *Lookup) cachedHost(host string) (RegionInfo, bool) {
+	l.cacheMu.RLock()
+	cached, ok := l.dnsCache[host]
+	l.cacheMu.RUnlock()
+	return cached.info, ok && time.Now().Before(cached.expiresAt)
+}
 
-	// Cache the result
+func (l *Lookup) cacheHost(host string, info RegionInfo, ttl time.Duration) {
+	l.cacheMu.RLock()
+	epoch := l.cacheEpoch
+	l.cacheMu.RUnlock()
+	l.cacheHostAtEpoch(host, info, ttl, epoch)
+}
+
+func (l *Lookup) cacheHostAtEpoch(host string, info RegionInfo, ttl time.Duration, epoch uint64) {
 	l.cacheMu.Lock()
-	l.dnsCache[extractHostFromURI(uri)] = result
-	l.cacheMu.Unlock()
-
-	return result
+	defer l.cacheMu.Unlock()
+	if l.cacheEpoch != epoch {
+		return // A completed database update invalidated this in-flight miss.
+	}
+	if l.dnsCache == nil {
+		l.dnsCache = make(map[string]cachedRegion)
+	}
+	if len(l.dnsCache) >= maxDNSCacheEntries {
+		// Keep allocation bounded for large/changing subscriptions; expiring
+		// entries naturally refill on demand. Arbitrary eviction is sufficient
+		// here because the cache is only an optimization, never routing state.
+		for key := range l.dnsCache {
+			delete(l.dnsCache, key)
+			break
+		}
+	}
+	l.dnsCache[host] = cachedRegion{info: info, expiresAt: time.Now().Add(ttl)}
 }
 
 // extractHostFromURI extracts the host/IP from various proxy URI formats

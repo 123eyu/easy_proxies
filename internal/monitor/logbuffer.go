@@ -5,49 +5,61 @@ import (
 	"sync"
 )
 
-// LogBuffer is a thread-safe ring buffer that captures recent log output.
-// It implements io.Writer so it can be plugged into log.SetOutput via io.MultiWriter.
+// LogBuffer is a fixed-capacity, thread-safe ring capturing recent log output.
+// Writes retain only the newest bytes without allocating in proportion to the
+// caller's write size or periodically copying all previously retained logs.
 type LogBuffer struct {
-	mu   sync.Mutex
-	buf  []byte
-	size int
+	mu    sync.Mutex
+	buf   []byte
+	size  int
+	start int
+	count int
 }
 
-// NewLogBuffer creates a ring buffer that keeps the last `size` bytes of log output.
 func NewLogBuffer(size int) *LogBuffer {
-	return &LogBuffer{
-		buf:  make([]byte, 0, size),
-		size: size,
+	if size < 0 {
+		size = 0
 	}
+	return &LogBuffer{buf: make([]byte, size), size: size}
 }
 
-// Write implements io.Writer. Appends data and trims the front if over capacity.
 func (lb *LogBuffer) Write(p []byte) (n int, err error) {
+	n = len(p)
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
-
-	lb.buf = append(lb.buf, p...)
-	if len(lb.buf) > lb.size {
-		lb.buf = lb.buf[len(lb.buf)-lb.size:]
+	if lb.size == 0 || n == 0 {
+		return n, nil
 	}
-	return len(p), nil
+	if n >= lb.size {
+		copy(lb.buf, p[n-lb.size:])
+		lb.start, lb.count = 0, lb.size
+		return n, nil
+	}
+	end := (lb.start + lb.count) % lb.size
+	first := copy(lb.buf[end:], p)
+	copy(lb.buf, p[first:])
+	if overflow := lb.count + n - lb.size; overflow > 0 {
+		lb.start = (lb.start + overflow) % lb.size
+		lb.count = lb.size
+	} else {
+		lb.count += n
+	}
+	return n, nil
 }
 
-// Content returns a copy of the current buffer contents.
 func (lb *LogBuffer) Content() string {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
-	return string(lb.buf)
+	if lb.count == 0 {
+		return ""
+	}
+	content := make([]byte, lb.count)
+	first := copy(content, lb.buf[lb.start:])
+	copy(content[first:], lb.buf[:lb.count-first])
+	return string(content)
 }
 
 // SharedLogBuffer is the global log buffer accessible by the server.
-var SharedLogBuffer *LogBuffer
+var SharedLogBuffer = NewLogBuffer(64 * 1024)
 
-func init() {
-	SharedLogBuffer = NewLogBuffer(64 * 1024) // 64KB ring buffer
-}
-
-// LogWriter returns an io.Writer that can be used with io.MultiWriter to capture logs.
-func LogWriter() io.Writer {
-	return SharedLogBuffer
-}
+func LogWriter() io.Writer { return SharedLogBuffer }

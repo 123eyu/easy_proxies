@@ -4,16 +4,20 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/routing"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -59,10 +63,14 @@ type Options struct {
 	// Sticky pins each client (by source IP) to a single member, only
 	// re-selecting when the pinned member becomes unavailable. Pool/hybrid entry only.
 	Sticky bool
+	// SessionRouting enables explicit named sessions supplied by the inbound.
+	// Unnamed requests retain the pool's normal scheduling behaviour.
+	SessionRouting bool
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
 type MemberMeta struct {
+	Identity      string // Stable opaque node identity, independent of its tag/name.
 	Name          string
 	URI           string
 	Mode          string
@@ -92,6 +100,7 @@ type poolOutbound struct {
 	options        Options
 	mode           string
 	members        []*memberState
+	membersByID    map[string][]*memberState
 	mu             sync.Mutex
 	rrCounter      atomic.Uint32
 	rng            *rand.Rand
@@ -101,6 +110,7 @@ type poolOutbound struct {
 	sticky         bool
 	stickyMu       sync.Mutex        // protects stickyMap
 	stickyMap      map[string]string // sticky key (client source IP) -> member tag
+	sessionStore   *routing.Store
 }
 
 func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger, tag string, options Options) (adapter.Outbound, error) {
@@ -132,6 +142,12 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 	}
 	if p.sticky {
 		p.stickyMap = make(map[string]string)
+	}
+	if normalized.SessionRouting {
+		p.sessionStore = routing.StoreFromContext(ctx)
+		if p.sessionStore == nil {
+			p.sessionStore = routing.NewStore(0, 0)
+		}
 	}
 
 	// Register nodes immediately if monitor is available
@@ -283,14 +299,25 @@ func (p *poolOutbound) initializeMembersLocked() error {
 		members = append(members, member)
 	}
 	p.members = members
+	p.indexMembersLocked()
 	p.logger.Info("pool initialized with ", len(members), " members")
 
 	return nil
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	lease, binding, err := p.acquireSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if lease != nil {
+		defer lease.Release()
+	}
 	maxAttempts := p.maxAttempts()
 	stickyKey := p.stickyKeyFromCtx(ctx)
+	if lease != nil {
+		stickyKey = ""
+	}
 	singleMember := len(p.options.Members) <= 1
 	var tried map[string]bool
 	if !singleMember && maxAttempts > 1 {
@@ -298,7 +325,15 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		member, err := p.pickMemberFiltered(network, tried, stickyKey)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var member *memberState
+		if lease != nil {
+			member, err = p.pickMemberForSession(network, tried, binding.NodeID)
+		} else {
+			member, err = p.pickMemberFiltered(network, tried, stickyKey)
+		}
 		if err != nil {
 			if lastErr != nil {
 				return nil, fmt.Errorf("%w (after %d attempt(s); last: %v)", err, attempt-1, lastErr)
@@ -309,6 +344,10 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		conn, dialErr := member.outbound.DialContext(ctx, network, destination)
 		if dialErr != nil {
 			p.decActive(member)
+			// A caller cancellation is not evidence of an unhealthy upstream.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			p.recordFailure(member, dialErr)
 			lastErr = dialErr
 			if tried != nil {
@@ -323,10 +362,23 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			}
 			break
 		}
+		if err := ctx.Err(); err != nil {
+			_ = conn.Close()
+			p.decActive(member)
+			return nil, err
+		}
 		if attempt > 1 {
 			p.logger.Info("dial succeeded via ", member.tag, " after ", attempt, " attempts")
 		}
 		p.recordSuccess(member)
+		if lease != nil && network == N.NetworkTCP {
+			meta := p.options.Metadata[member.tag]
+			reason := "node_unavailable"
+			if lastErr != nil {
+				reason = "dial_failed"
+			}
+			lease.Bind(p.memberIdentity(member), member.tag, meta.Name, reason)
+		}
 		return p.wrapConn(conn, member), nil
 	}
 	if lastErr == nil {
@@ -336,8 +388,18 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	lease, binding, err := p.acquireSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if lease != nil {
+		defer lease.Release()
+	}
 	maxAttempts := p.maxAttempts()
 	stickyKey := p.stickyKeyFromCtx(ctx)
+	if lease != nil {
+		stickyKey = ""
+	}
 	singleMember := len(p.options.Members) <= 1
 	var tried map[string]bool
 	if !singleMember && maxAttempts > 1 {
@@ -345,7 +407,17 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		member, err := p.pickMemberFiltered(N.NetworkUDP, tried, stickyKey)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var member *memberState
+		if lease != nil {
+			// UDP may use the TCP pin if supported, but capability filtering and
+			// packet retries must never migrate the primary TCP binding.
+			member, err = p.pickMemberForSession(N.NetworkUDP, tried, binding.NodeID)
+		} else {
+			member, err = p.pickMemberFiltered(N.NetworkUDP, tried, stickyKey)
+		}
 		if err != nil {
 			if lastErr != nil {
 				return nil, fmt.Errorf("%w (after %d attempt(s); last: %v)", err, attempt-1, lastErr)
@@ -356,6 +428,9 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		conn, listenErr := member.outbound.ListenPacket(ctx, destination)
 		if listenErr != nil {
 			p.decActive(member)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			p.recordFailure(member, listenErr)
 			lastErr = listenErr
 			if tried != nil {
@@ -370,6 +445,11 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			}
 			break
 		}
+		if err := ctx.Err(); err != nil {
+			_ = conn.Close()
+			p.decActive(member)
+			return nil, err
+		}
 		if attempt > 1 {
 			p.logger.Info("listen-packet succeeded via ", member.tag, " after ", attempt, " attempts")
 		}
@@ -380,6 +460,35 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		lastErr = E.New("no healthy proxy available")
 	}
 	return nil, fmt.Errorf("listen-packet failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func (p *poolOutbound) acquireSession(ctx context.Context) (*routing.Lease, routing.Binding, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, routing.Binding{}, err
+	}
+	key := routing.SessionFromContext(ctx)
+	if !p.options.SessionRouting || key == "" {
+		return nil, routing.Binding{}, nil
+	}
+	p.mu.Lock()
+	if p.sessionStore == nil {
+		p.sessionStore = routing.NewStore(0, 0)
+	}
+	store := p.sessionStore
+	p.mu.Unlock()
+	lease, err := store.Acquire(ctx, key)
+	if err != nil {
+		return nil, routing.Binding{}, err
+	}
+	binding, _ := lease.Binding()
+	return lease, binding, nil
+}
+
+func (p *poolOutbound) memberIdentity(member *memberState) string {
+	if identity := p.options.Metadata[member.tag].Identity; identity != "" {
+		return identity
+	}
+	return member.tag
 }
 
 // maxAttempts returns the configured retry budget (>=1).
@@ -397,17 +506,38 @@ func (p *poolOutbound) maxAttempts() int {
 // When `tried` is nil or every healthy member has been tried, falls back to picking
 // any healthy member (ensuring single-member pools retry the same node).
 func (p *poolOutbound) pickMemberFiltered(network string, tried map[string]bool, stickyKey string) (*memberState, error) {
+	return p.pickMemberFor(network, tried, stickyKey, "")
+}
+
+func (p *poolOutbound) pickMemberForSession(network string, tried map[string]bool, nodeID string) (*memberState, error) {
+	return p.pickMemberFor(network, tried, "", nodeID)
+}
+
+func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stickyKey, nodeID string) (*memberState, error) {
 	now := time.Now()
-	candidates := p.getCandidateBuffer()
 
 	p.mu.Lock()
 	if len(p.members) == 0 {
 		if err := p.initializeMembersLocked(); err != nil {
 			p.mu.Unlock()
-			p.putCandidateBuffer(candidates)
 			return nil, err
 		}
 	}
+	// Most named-session traffic already has a successful pin. Resolve it in
+	// O(1) rather than scanning and locking every node in a large pool.
+	if nodeID != "" {
+		if p.membersByID == nil {
+			p.indexMembersLocked()
+		}
+		for _, member := range p.membersByID[nodeID] {
+			if !tried[member.tag] && (network == "" || common.Contains(member.outbound.Network(), network)) &&
+				(member.shared == nil || !member.shared.isBlacklisted(now)) {
+				p.mu.Unlock()
+				return member, nil
+			}
+		}
+	}
+	candidates := p.getCandidateBuffer()
 	candidates = p.availableMembersLocked(now, network, candidates)
 	p.mu.Unlock()
 
@@ -439,7 +569,18 @@ func (p *poolOutbound) pickMemberFiltered(network string, tried map[string]bool,
 		}
 	}
 
-	member := p.selectMember(candidates, stickyKey)
+	var member *memberState
+	if nodeID != "" {
+		for _, candidate := range candidates {
+			if p.memberIdentity(candidate) == nodeID {
+				member = candidate
+				break
+			}
+		}
+	}
+	if member == nil {
+		member = p.selectMember(candidates, stickyKey)
+	}
 	p.putCandidateBuffer(candidates)
 	return member, nil
 }
@@ -580,18 +721,37 @@ func (p *poolOutbound) selectByMode(candidates []*memberState) *memberState {
 		p.rngMu.Unlock()
 		return candidates[idx]
 	case modeBalance:
-		var selected *memberState
+		// Rotate only among equally least-loaded members. Rotating the start
+		// of the full list would bias ties that follow a busier member.
 		var minActive int32
+		var selected *memberState
+		tied := 0
 		for _, member := range candidates {
 			var active int32
 			if member.shared != nil {
 				active = member.shared.activeCount()
 			}
-			if selected == nil || active < minActive {
-				selected = member
-				minActive = active
+			if tied == 0 || active < minActive {
+				minActive, tied, selected = active, 1, member
+			} else if active == minActive {
+				tied++
 			}
 		}
+		choice := int(p.rrCounter.Add(1)-1) % tied
+		for _, member := range candidates {
+			var active int32
+			if member.shared != nil {
+				active = member.shared.activeCount()
+			}
+			if active == minActive {
+				if choice == 0 {
+					return member
+				}
+				choice--
+			}
+		}
+		// Counts can change between passes; retain the observed minimum rather
+		// than returning nil or selecting an unrelated busier candidate.
 		return selected
 	case modeLatency:
 		// Pick the candidate with the lowest measured latency.
@@ -713,36 +873,29 @@ func upgradeProbeConn(ctx context.Context, conn net.Conn, host string, useTLS bo
 	return tlsConn, nil
 }
 
-// httpProbe performs an HTTP probe through the connection and measures TTFB.
-// It sends a minimal HTTP request and waits for the first byte of response.
+const maxProbeHeaderBytes = 64 * 1024
+
+// httpProbe validates an HTTP response without reading its body. A socket that
+// emits one byte, a proxy authentication failure, or a quota/error response is
+// not a successful health check. Header size and deadlines bound the parser.
 func httpProbe(conn net.Conn, host string) (time.Duration, error) {
-	// Build HTTP request
-	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", host)
-
-	// Try to set write deadline (ignore errors for connections that don't support it)
+	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: easy-proxies-health\r\n\r\n", host)
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-
-	// Record time just before sending request
 	start := time.Now()
-
-	// Send HTTP request
-	if _, err := conn.Write([]byte(req)); err != nil {
+	if _, err := io.WriteString(conn, req); err != nil {
 		return 0, fmt.Errorf("write request: %w", err)
 	}
-
-	// Try to set read deadline (ignore errors for connections that don't support it)
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-	// Read first byte (TTFB - Time To First Byte)
-	reader := bufio.NewReader(conn)
-	_, err := reader.ReadByte()
+	response, err := http.ReadResponse(bufio.NewReader(io.LimitReader(conn, maxProbeHeaderBytes)), &http.Request{Method: http.MethodGet})
 	if err != nil {
-		return 0, fmt.Errorf("read response: %w", err)
+		return 0, fmt.Errorf("read HTTP response: %w", err)
 	}
-
-	// Calculate TTFB
-	ttfb := time.Since(start)
-	return ttfb, nil
+	// The caller owns and closes conn. Closing response.Body here could drain
+	// an unbounded or stalled body; only the headers matter to this probe.
+	if response.StatusCode < 200 || response.StatusCode >= 400 {
+		return 0, fmt.Errorf("HTTP probe returned status %d", response.StatusCode)
+	}
+	return time.Since(start), nil
 }
 
 // probeMember dials the probe destination through a member and measures latency.
@@ -756,7 +909,7 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 	start := time.Now()
 	rawConn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 	if err != nil {
-		if member.entry != nil {
+		if member.entry != nil && !errors.Is(ctx.Err(), context.Canceled) {
 			member.entry.RecordFailure(err)
 		}
 		return 0, err
@@ -778,7 +931,7 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 	// Strict mode: upgrade to TLS and verify the certificate chain so that
 	// nodes whose exit hijacks TLS (self-signed certs) fail the probe.
 	if conn, err = upgradeProbeConn(ctx, conn, host, useTLS); err != nil {
-		if member.entry != nil {
+		if member.entry != nil && !errors.Is(ctx.Err(), context.Canceled) {
 			member.entry.RecordFailure(err)
 		}
 		return 0, err
@@ -786,12 +939,15 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 
 	// Perform HTTP probe to measure actual latency (TTFB).
 	if _, err = httpProbe(conn, destination.AddrString()); err != nil {
-		if member.entry != nil {
+		if member.entry != nil && !errors.Is(ctx.Err(), context.Canceled) {
 			member.entry.RecordFailure(err)
 		}
 		return 0, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	duration := time.Since(start)
 	if member.entry != nil {
 		member.entry.RecordSuccessWithLatency(duration)
@@ -922,4 +1078,21 @@ func (p *poolOutbound) putCandidateBuffer(buf []*memberState) {
 		return
 	}
 	p.candidatesPool.Put(buf[:0])
+}
+
+// indexMembersLocked builds a stable identity index once per pool lifecycle.
+// Duplicate subscription entries retain their original candidate order.
+func (p *poolOutbound) indexMembersLocked() {
+	p.membersByID = make(map[string][]*memberState, len(p.members))
+	for _, member := range p.members {
+		id := p.memberIdentity(member)
+		p.membersByID[id] = append(p.membersByID[id], member)
+	}
+}
+
+// Close releases the global registry reference without touching a replacement
+// pool or the manager-owned named-session store.
+func (p *poolOutbound) Close() error {
+	unregisterDialer(p.Tag(), p)
+	return nil
 }

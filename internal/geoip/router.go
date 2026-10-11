@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,9 @@ type Router struct {
 	global     PoolDialer                     // default pool for requests without region path
 	transports map[PoolDialer]*http.Transport // cached transports per dialer
 	server     *http.Server
+	closed     bool
+	tunnels    map[net.Conn]net.Conn // hijacked client -> upstream
+	stopCh     chan struct{}
 	mu         sync.RWMutex
 	logger     *log.Logger
 }
@@ -48,6 +52,8 @@ func NewRouter(cfg RouterConfig, logger *log.Logger) *Router {
 		cfg:        cfg,
 		pools:      make(map[string]PoolDialer),
 		transports: make(map[PoolDialer]*http.Transport),
+		tunnels:    make(map[net.Conn]net.Conn),
+		stopCh:     make(chan struct{}),
 		logger:     logger,
 	}
 }
@@ -58,7 +64,7 @@ func (r *Router) SetPool(region string, dialer PoolDialer) {
 	defer r.mu.Unlock()
 	r.pools[region] = dialer
 	// Clear transport cache since pools changed
-	r.transports = make(map[PoolDialer]*http.Transport)
+	r.closeIdleTransportsLocked()
 }
 
 // SetGlobalPool sets the default pool for requests without region path
@@ -67,29 +73,54 @@ func (r *Router) SetGlobalPool(dialer PoolDialer) {
 	defer r.mu.Unlock()
 	r.global = dialer
 	// Clear transport cache since pools changed
+	r.closeIdleTransportsLocked()
+}
+
+func (r *Router) closeIdleTransportsLocked() {
+	for _, transport := range r.transports {
+		transport.CloseIdleConnections()
+	}
 	r.transports = make(map[PoolDialer]*http.Transport)
 }
 
 // Start starts the GeoIP router HTTP server
 func (r *Router) Start(ctx context.Context) error {
-	addr := fmt.Sprintf("%s:%d", r.cfg.Listen, r.cfg.Port)
-
-	r.server = &http.Server{
-		Addr:    addr,
-		Handler: r,
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.server != nil {
+		return fmt.Errorf("GeoIP router has already been started or stopped")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	addr := net.JoinHostPort(r.cfg.Listen, strconv.Itoa(int(r.cfg.Port)))
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen GeoIP router: %w", err)
+	}
+	server := &http.Server{
+		Addr: addr, Handler: r,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       90 * time.Second,
+	}
+	r.server = server
+	stopCh := r.stopCh
 
 	go func() {
+		defer r.Stop()
 		r.logger.Printf("🌐 GeoIP Router started on %s", addr)
 		r.logger.Println("   Routes: /jp, /kr, /us, /hk, /tw, /sg, /other (default: all nodes)")
-		if err := r.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			r.logger.Printf("GeoIP router error: %v", err)
 		}
 	}()
 
 	go func() {
-		<-ctx.Done()
-		r.Stop()
+		select {
+		case <-ctx.Done():
+			r.Stop()
+		case <-stopCh:
+		}
 	}()
 
 	return nil
@@ -97,10 +128,29 @@ func (r *Router) Start(ctx context.Context) error {
 
 // Stop stops the GeoIP router
 func (r *Router) Stop() error {
-	if r.server != nil {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	if r.stopCh != nil {
+		close(r.stopCh)
+	}
+	server := r.server
+	r.closeIdleTransportsLocked()
+	for client, upstream := range r.tunnels {
+		client.Close()
+		upstream.Close()
+	}
+	r.mu.Unlock()
+	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return r.server.Shutdown(ctx)
+		if err := server.Shutdown(ctx); err != nil {
+			server.Close()
+			return err
+		}
 	}
 	return nil
 }
@@ -108,15 +158,15 @@ func (r *Router) Stop() error {
 // checkProxyAuth validates the Proxy-Authorization header.
 // Proxy clients send credentials via "Proxy-Authorization", not "Authorization".
 func (r *Router) checkProxyAuth(req *http.Request) bool {
-	auth := req.Header.Get("Proxy-Authorization")
-	if auth == "" {
+	values := req.Header.Values("Proxy-Authorization")
+	if len(values) != 1 || len(values[0]) > 2048 {
 		return false
 	}
-	const prefix = "Basic "
-	if !strings.HasPrefix(auth, prefix) {
+	fields := strings.Fields(values[0])
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Basic") {
 		return false
 	}
-	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	decoded, err := base64.StdEncoding.DecodeString(fields[1])
 	if err != nil {
 		return false
 	}
@@ -147,6 +197,11 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// Get the appropriate pool
 	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		http.Error(w, "Proxy router stopped", http.StatusServiceUnavailable)
+		return
+	}
 	var dialer PoolDialer
 	if region != "" {
 		dialer = r.pools[region]
@@ -209,12 +264,19 @@ func (r *Router) parseRequest(req *http.Request) (region, targetHost string, err
 		prefix := "/" + reg + "/"
 		if strings.HasPrefix(path, prefix) {
 			// Rewrite the path
+			escapedPath := req.URL.EscapedPath()
 			req.URL.Path = "/" + strings.TrimPrefix(path, prefix)
+			if strings.HasPrefix(escapedPath, prefix) {
+				req.URL.RawPath = "/" + strings.TrimPrefix(escapedPath, prefix)
+			} else {
+				req.URL.RawPath = ""
+			}
 			return reg, req.Host, nil
 		}
 		// Also check for exact match like /jp
 		if path == "/"+reg {
 			req.URL.Path = "/"
+			req.URL.RawPath = ""
 			return reg, req.Host, nil
 		}
 	}
@@ -225,9 +287,9 @@ func (r *Router) parseRequest(req *http.Request) (region, targetHost string, err
 // handleConnect handles HTTPS CONNECT tunneling
 func (r *Router) handleConnect(w http.ResponseWriter, req *http.Request, dialer PoolDialer, targetHost string) {
 	ctx, cancel := context.WithTimeout(req.Context(), 30*time.Second)
-	defer cancel()
 
 	targetConn, err := dialer.DialContext(ctx, "tcp", targetHost)
+	cancel() // The dial timeout must not limit an established tunnel's lifetime.
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to connect: %v", err), http.StatusBadGateway)
 		return
@@ -240,36 +302,68 @@ func (r *Router) handleConnect(w http.ResponseWriter, req *http.Request, dialer 
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, buffered, err := hijacker.Hijack()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Hijack failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 	defer clientConn.Close()
+	clientConn.SetDeadline(time.Time{})
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	if r.tunnels == nil {
+		r.tunnels = make(map[net.Conn]net.Conn)
+	}
+	r.tunnels[clientConn] = targetConn
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.tunnels, clientConn)
+		r.mu.Unlock()
+	}()
+	closeBoth := func() {
+		clientConn.Close()
+		targetConn.Close()
+	}
+	stopCancellation := context.AfterFunc(req.Context(), closeBoth)
+	defer stopCancellation()
 
 	// Send 200 Connection Established
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		return
+	}
+	if err := buffered.Flush(); err != nil {
+		return
+	}
 
-	// Bidirectional copy
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	// A hijacker's reader may already contain bytes following CONNECT. On
+	// either direction finishing, close both ends to unblock its peer copy.
+	done := make(chan struct{}, 2)
 	go func() {
-		defer wg.Done()
-		io.Copy(targetConn, clientConn)
+		// Suppress bufio.Reader.WriteTo's initial zero-length write: some
+		// wrapped proxy connections treat even that write as a handshake.
+		io.Copy(targetConn, struct{ io.Reader }{buffered.Reader})
+		done <- struct{}{}
 	}()
-
 	go func() {
-		defer wg.Done()
 		io.Copy(clientConn, targetConn)
+		done <- struct{}{}
 	}()
-
-	wg.Wait()
+	<-done
+	closeBoth()
+	<-done
 }
 
 // getTransport returns a cached http.Transport for the given dialer, creating one if needed.
 func (r *Router) getTransport(dialer PoolDialer) *http.Transport {
 	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return nil
+	}
 	t, ok := r.transports[dialer]
 	r.mu.RUnlock()
 	if ok {
@@ -277,15 +371,24 @@ func (r *Router) getTransport(dialer PoolDialer) *http.Transport {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
 	// Double-check after acquiring write lock
 	if t, ok = r.transports[dialer]; ok {
 		return t
 	}
+	if r.transports == nil {
+		r.transports = make(map[PoolDialer]*http.Transport)
+	}
 	t = &http.Transport{
-		DialContext:         dialer.DialContext,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
+		DialContext:           dialer.DialContext,
+		DisableCompression:    true,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
 	}
 	r.transports[dialer] = t
 	return t
@@ -293,11 +396,12 @@ func (r *Router) getTransport(dialer PoolDialer) *http.Transport {
 
 // handleHTTP handles regular HTTP requests
 func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request, dialer PoolDialer, targetHost string) {
-	ctx, cancel := context.WithTimeout(req.Context(), 30*time.Second)
-	defer cancel()
-
-	// Create a new request to the target
-	targetURL := req.URL
+	// Clone preserves Host, ContentLength and the body/trailer pairing. A
+	// total request timeout would incorrectly truncate streaming responses.
+	outReq := req.Clone(req.Context())
+	outReq.Body, outReq.Trailer = req.Body, req.Trailer
+	outReq.RequestURI = ""
+	targetURL := outReq.URL
 	if targetURL.Host == "" {
 		targetURL.Host = targetHost
 	}
@@ -305,25 +409,18 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request, dialer Poo
 		targetURL.Scheme = "http"
 	}
 
-	outReq, err := http.NewRequestWithContext(ctx, req.Method, targetURL.String(), req.Body)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create request: %v", err), http.StatusInternalServerError)
+	if targetURL.Scheme != "http" && targetURL.Scheme != "https" {
+		http.Error(w, "Unsupported proxy URL scheme", http.StatusBadRequest)
 		return
 	}
-
-	// Copy headers
-	for key, values := range req.Header {
-		for _, value := range values {
-			outReq.Header.Add(key, value)
-		}
-	}
-
-	// Remove hop-by-hop headers
-	outReq.Header.Del("Proxy-Connection")
-	outReq.Header.Del("Proxy-Authorization")
+	removeHopHeaders(outReq.Header)
 
 	// Use cached transport with connection pooling
 	transport := r.getTransport(dialer)
+	if transport == nil {
+		http.Error(w, "Proxy router stopped", http.StatusServiceUnavailable)
+		return
+	}
 
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
@@ -331,6 +428,7 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request, dialer Poo
 		return
 	}
 	defer resp.Body.Close()
+	removeHopHeaders(resp.Header)
 
 	// Copy response headers
 	for key, values := range resp.Header {
@@ -338,7 +436,45 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request, dialer Poo
 			w.Header().Add(key, value)
 		}
 	}
+	for key := range resp.Trailer {
+		w.Header().Add("Trailer", key)
+	}
 
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	var writer io.Writer = w
+	if resp.ContentLength == -1 {
+		// Event streams and chunked responses must be visible before EOF.
+		controller := http.NewResponseController(w)
+		if controller.Flush() == nil {
+			writer = flushingWriter{ResponseWriter: w, controller: controller}
+		}
+	}
+	io.Copy(writer, resp.Body)
+	for key, values := range resp.Trailer {
+		w.Header()[key] = values
+	}
+}
+
+type flushingWriter struct {
+	http.ResponseWriter
+	controller *http.ResponseController
+}
+
+func (w flushingWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if err == nil {
+		err = w.controller.Flush()
+	}
+	return n, err
+}
+
+func removeHopHeaders(headers http.Header) {
+	for _, value := range headers.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			headers.Del(strings.TrimSpace(token))
+		}
+	}
+	for _, name := range []string{"Connection", "Proxy-Connection", "Proxy-Authorization", "Proxy-Authenticate", "Keep-Alive", "TE", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		headers.Del(name)
+	}
 }

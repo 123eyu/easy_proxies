@@ -46,3 +46,16 @@ func ResetDialerRegistry() {
 		return true
 	})
 }
+
+// unregisterDialer removes only the closing pool's adapter. A replacement pool
+// may already have registered the same tag during a failed startup/rollback.
+func unregisterDialer(tag string, p *poolOutbound) {
+	value, ok := dialerRegistry.Load(tag)
+	if !ok {
+		return
+	}
+	adapter, ok := value.(*poolDialerAdapter)
+	if ok && adapter.pool == p {
+		dialerRegistry.CompareAndDelete(tag, value)
+	}
+}

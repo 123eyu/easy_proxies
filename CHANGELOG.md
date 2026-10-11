@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-10-12
+
+### Added
+- **Named sessions on the main HTTP/SOCKS5 pool entry**: authenticate as `username.sessionID` to reuse a TCP upstream node across connections; the bare username retains normal pool scheduling. Session IDs accept 1–64 ASCII letters, digits, underscores, or hyphens. Available in `pool`/`hybrid` mode with a configured listener username; password verification uses the existing listener credentials.
+- **Bounded session lifecycle**: `sticky.session_enabled` defaults to true, `sticky.session_ttl` defaults to 24 hours of connection-dial inactivity, and `sticky.max_sessions` defaults to 10,000 bindings with LRU eviction. Manager-owned bindings match stable URI identities across subscription refreshes/core reloads, but are cleared on process restart.
+- **Proxy session management API**: list and reset named bindings with `/api/proxy-sessions`, reset an individual full-username binding with `/api/proxy-sessions/{id}`, and generate HTTP/SOCKS5 links with `/api/proxy-sessions/links` without dialing or creating a binding.
+- **Session routing UI**: add dashboard connection shortcuts and a dedicated session page with random IDs, masked URL previews, HTTP/SOCKS5 URL/curl copying, binding search, and single/all-session reset controls; expose named-session settings alongside the compatible source-IP entry.
+- **Quality gates**: reusable CI checks for formatting, vet, unit/race tests, production feature tags, UI/entrypoint fixtures, reachable vulnerability scanning, and Linux amd64/arm64 builds before Docker publication.
+- **Project review report**: document completed fixes, measured performance, upgrade behavior, validation limits, and the next iteration roadmap in `docs/project-review-2026-10-11.md`.
+
+### Changed
+- Keep the existing `sticky.enabled`/`sticky.port` source-IP entry compatible and independent of main-port named sessions. Fixed sessions bind upstream nodes, not guaranteed public exit IPs; failover follows pool availability/retry policy without migrating established connections or replaying application requests. SOCKS5 UDP fallback is request-local and does not replace the TCP binding.
+- Document main-port session usage, lifecycle limits, compatibility, and management APIs; clarify the default Docker configuration path and replacing placeholder nodes before use. Add the Chinese session routing guide and update the example's supported protocol list.
+- Refresh the native HTML management layout with mobile navigation, node search/status filters, labelled controls and keyboard focus support, reduced-motion support, and chart-library offline degradation, while retaining light/dark/system themes without new frontend dependencies.
+- Require Go 1.26.9 and update the Docker builder and compatible networking/cryptography/gRPC dependencies; keep sing-box and its coupled gVisor/uTLS versions unchanged.
+- Render node configuration/diagnostics views in on-demand 300-row batches, cap probe timelines, and suspend dashboard streams/log polling in hidden tabs. Add cancellable requests, bounded timeouts, and visible errors for busy probe streams.
+- Use identity-indexed named-session selection and a fixed-capacity, allocation-free log write ring. Read subscription status through a lightweight snapshot instead of copying every node.
+- Apply management password changes immediately, revoke existing login sessions, and expose authentication status/logout through `GET`/`DELETE /api/auth`.
+
+### Fixed
+- Canonicalize VMess node identities: URL-format links ignore query-parameter ordering; encoded JSON links ignore the display-name `ps` field, top-level JSON key ordering, and supported base64 encoding variants. Normalize legacy `node_ports.json` keys during migration to preserve existing ports rather than reassigning nodes on upgrade; equivalent identities also keep named-session bindings across reloads.
+- Stage only management-owned settings and persist them with one `SaveManagementSettings` operation, retaining `sticky` settings and on-disk node/subscription configuration rather than overwriting it from a stale full-config snapshot. Coordinate settings publication with node CRUD through the manager's optional settings lock.
+- Only configure the sing-box Clash API traffic service when `with_clash_api` is compiled in and management is enabled. Default source builds no longer fail startup by requesting an unavailable optional feature; Docker feature-tagged builds retain traffic statistics.
+- Do not count caller cancellation during a pool dial as a node failure or unnecessarily switch its session binding.
+- Mask proxy passwords in startup entry-point logs, and correctly encode URL credentials and IPv6 hosts. Full credentialed URLs remain available through the management copy/generation flow, using the existing management authentication settings.
+- Apply valid host selection and URL encoding to existing proxy exports as well as generated session links: do not export wildcard listen addresses, bracket IPv6 correctly, and percent-encode special characters in credentials. Preserve the existing healthy-node/default, `all=true`, pool, and GeoIP export behavior.
+- Preserve management login cookies when a reverse proxy forwards non-Bearer Authorization headers; explicit Bearer credentials retain precedence, including invalid or malformed tokens.
+- Derive displayed node health from backend availability/initial-check/blacklist state instead of cumulative failure counts; report non-successful API responses, including failed node releases, rather than displaying false success. Fix the timestamp formatter's undefined-variable reference.
+- Disable settings saves after a settings-load error to prevent blank form values from overwriting configuration; clear generated credentialed links on management authentication expiry and safely escape special characters in full session usernames used by display/reset controls.
+- Release the manager lock before HTTP shutdown so settings handlers do not deadlock service termination; bound shutdown without an explicit deadline to a 5-second drain and force-close unfinished streams afterward.
+- Serialize configuration read-modify-write transactions across writers, write atomically in ordinary directories, and retain locked in-place compatibility for file bind mounts. Preserve file modes and independent node, management, and subscription fields during concurrent saves.
+- Serialize runtime lifecycle operations; propagate startup failures/cancellation, prevent reload after close, return independent configuration snapshots, and roll back runtime/GeoIP state when reload or subscription cache persistence fails.
+- Keep manual subscription refresh available when periodic refresh is disabled; coalesce concurrent refreshes, cancel/join the worker on stop, preserve inline nodes/settings, and retain the previous subscription set if any provider fails or returns empty content. Runtime URL removal and timer disabling now supersede stale worker settings.
+- Preserve active manual node bans across successful probes and all-members-banned fallback; validate health probes against an actual successful HTTP response and fairly rotate equal-load candidates. Closing an old pool no longer unregisters its replacement.
+- Preserve GeoIP CONNECT pre-read data, close both tunnel ends on cancellation/EOF, propagate listener failures, strip all hop-by-hop header values, and stream responses. Bound/validate MMDB updates, cancel them on close, and add bounded TTL/singleflight DNS caching.
+- Make traffic SSE parsing frame-complete, bounded, and cancellation-aware; eliminate background goroutines created by unused management servers, use bounded probe worker pools, and prevent stale probe results from overwriting newer health state.
+- Validate settings without network side effects; reject malformed/multiple JSON objects and invalid values without publishing them. Preserve disabled GeoIP `0s` compatibility without silently enabling automatic updates. Protect management writes with same-origin checks and HttpOnly/SameSite cookies.
+- Preserve URL/base64 subscription variants, literal `+` in names, IPv6 endpoints, special credentials, VMess cipher/alterId, and optional SIP002 root paths. Reject invalid upstream ports, use 443 by default for HTTPS proxies, and omit complete credentialed URIs from URL parse errors.
+- Avoid reserved listener ports and integer wraparound during node-port allocation; repair duplicated saved assignments and reject explicit port conflicts consistently regardless of node order, retaining existing stable ports. Honor YAML inline manual ports at startup, including intentional changes to their own stale saved assignments.
+- Fail fast on invalid entrypoint configuration paths and keep real configuration, node lists, databases, logs, and local build artifacts out of the Docker context.
+
 ## [3.1.2] - 2026-10-08
 
 ### Fixed

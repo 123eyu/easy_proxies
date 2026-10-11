@@ -1,8 +1,10 @@
 package monitor
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
@@ -11,8 +13,10 @@ import (
 	"fmt"
 	"log"
 	mathrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,7 +24,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
-	"golang.org/x/sync/semaphore"
+	"easy_proxies/internal/routing"
 )
 
 //go:embed assets/index.html
@@ -42,6 +46,12 @@ type NodeManager interface {
 	TriggerReload(ctx context.Context) error
 }
 
+// settingsLocker shares the manager's lifecycle/CRUD lock when available. The
+// lock order is manager first, then cfgMu, matching manager -> SetConfig calls.
+type settingsLocker interface {
+	LockSettings() func()
+}
+
 // Sentinel errors for node operations.
 var (
 	ErrNodeNotFound = errors.New("节点不存在")
@@ -57,6 +67,13 @@ type SubscriptionRefresher interface {
 	UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration) error
 }
 
+// Context-aware refreshers stop waiting when an HTTP client disconnects, while
+// the background refresh remains governed by the subscription manager lifecycle.
+type contextualSubscriptionRefresher interface {
+	RefreshNowContext(context.Context) error
+	UpdateConfigAndRefreshContext(context.Context, []string, bool, time.Duration) error
+}
+
 // SubscriptionStatus represents subscription refresh status.
 type SubscriptionStatus struct {
 	LastRefresh   time.Time `json:"last_refresh"`
@@ -70,17 +87,23 @@ type SubscriptionStatus struct {
 
 // Server exposes HTTP endpoints for monitoring.
 type Server struct {
-	cfg    Config
-	cfgMu  sync.RWMutex   // 保护动态配置字段
-	cfgSrc *config.Config // 可持久化的配置对象
-	mgr    *Manager
-	srv    *http.Server
-	logger *log.Logger
+	cfg          Config
+	cfgMu        sync.RWMutex   // 保护动态配置字段
+	cfgSrc       *config.Config // 可持久化的配置对象
+	routingStore *routing.Store // Proxy affinity bindings, separate from login sessions.
+	mgr          *Manager
+	srv          *http.Server
+	logger       *log.Logger
 
 	// Session management
 	sessionMu  sync.RWMutex
 	sessions   map[string]*Session
 	sessionTTL time.Duration
+
+	ctx           context.Context
+	cancel        context.CancelFunc
+	startOnce     sync.Once
+	trafficClient *http.Client
 
 	// probeAllInFlight bounds batch "probe all" to a single concurrent run.
 	// Without it, N simultaneous requests each spin up to `concurrency` probes,
@@ -100,21 +123,29 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 		logger = log.Default()
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:        cfg,
 		mgr:        mgr,
 		logger:     logger,
 		sessions:   make(map[string]*Session),
 		sessionTTL: 24 * time.Hour,
+		ctx:        ctx,
+		cancel:     cancel,
+		trafficClient: &http.Client{Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ResponseHeaderTimeout: 5 * time.Second,
+			MaxIdleConns:          2, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second,
+		}},
 	}
-
-	// Start session cleanup goroutine
-	go s.cleanupExpiredSessions()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/settings", s.withAuth(s.handleSettings))
+	mux.HandleFunc("/api/proxy-sessions", s.withAuth(s.handleProxySessions))
+	mux.HandleFunc("/api/proxy-sessions/links", s.withAuth(s.handleProxySessionLinks))
+	mux.HandleFunc("/api/proxy-sessions/", s.withAuth(s.handleProxySessionItem))
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
 	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
@@ -128,22 +159,43 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
 	mux.HandleFunc("/api/traffic", s.withAuth(s.handleTraffic))
 	mux.HandleFunc("/api/logs", s.withAuth(s.handleLogs))
-	s.srv = &http.Server{Addr: cfg.Listen, Handler: mux}
+	s.srv = &http.Server{
+		Addr: cfg.Listen, Handler: mux,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
+		MaxHeaderBytes: 32 * 1024,
+		BaseContext:    func(net.Listener) context.Context { return s.ctx },
+	}
 	return s
 }
 
 // SetSubscriptionRefresher sets the subscription refresher for API endpoints.
 func (s *Server) SetSubscriptionRefresher(sr SubscriptionRefresher) {
 	if s != nil {
+		s.cfgMu.Lock()
 		s.subRefresher = sr
+		s.cfgMu.Unlock()
 	}
 }
 
 // SetNodeManager enables config-node CRUD endpoints.
 func (s *Server) SetNodeManager(nm NodeManager) {
 	if s != nil {
+		s.cfgMu.Lock()
 		s.nodeMgr = nm
+		s.cfgMu.Unlock()
 	}
+}
+
+func (s *Server) subscriptionRefresher() SubscriptionRefresher {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.subRefresher
+}
+
+func (s *Server) nodeManager() NodeManager {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.nodeMgr
 }
 
 // SetConfig binds the persistable config object for settings API.
@@ -153,17 +205,12 @@ func (s *Server) SetConfig(cfg *config.Config) {
 	}
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
-	// Preserve subscription config from previous cfgSrc if new config has none
-	if cfg != nil && s.cfgSrc != nil {
-		if len(cfg.Subscriptions) == 0 && len(s.cfgSrc.Subscriptions) > 0 {
-			cfg.Subscriptions = s.cfgSrc.Subscriptions
-		}
-		if cfg.SubscriptionRefresh.Interval == 0 && s.cfgSrc.SubscriptionRefresh.Interval > 0 {
-			cfg.SubscriptionRefresh = s.cfgSrc.SubscriptionRefresh
-		}
-	}
+	// The supplied snapshot is authoritative, including explicit empty
+	// subscriptions and zero/default refresh settings. Never backfill or mutate
+	// fields owned by the node/subscription lifecycle here.
 	s.cfgSrc = cfg
 	if cfg != nil {
+		s.setPasswordLocked(cfg.Management.Password)
 		s.cfg.ExternalIP = cfg.ExternalIP
 		s.cfg.ProbeTarget = cfg.Management.ProbeTarget
 		s.cfg.SkipCertVerify = cfg.SkipCertVerify
@@ -187,17 +234,6 @@ func (s *Server) SetConfig(cfg *config.Config) {
 	}
 }
 
-// getSettings returns current dynamic settings (thread-safe).
-func (s *Server) getSettings() (externalIP, probeTarget string, skipCertVerify bool, logCfg config.LogConfig) {
-	s.cfgMu.RLock()
-	defer s.cfgMu.RUnlock()
-	logCfg = config.LogConfig{}
-	if s.cfgSrc != nil {
-		logCfg = s.cfgSrc.Log
-	}
-	return s.cfg.ExternalIP, s.cfg.ProbeTarget, s.cfg.SkipCertVerify, logCfg
-}
-
 // currentProbeConcurrency returns the probe concurrency from the live config,
 // clamped to a safe range. Read per batch-probe request so WebUI changes apply
 // after a reload without restarting the process.
@@ -210,70 +246,38 @@ func (s *Server) currentProbeConcurrency() int64 {
 	return 32
 }
 
-// updateSettings updates dynamic settings and persists to config file.
-func (s *Server) updateSettings(externalIP, probeTarget string, skipCertVerify bool, logCfg *config.LogConfig, geoipEnabled bool) error {
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
-
-	s.cfg.ExternalIP = externalIP
-	s.cfg.ProbeTarget = probeTarget
-	s.cfg.SkipCertVerify = skipCertVerify
-
-	if s.cfgSrc == nil {
-		return errors.New("配置存储未初始化")
-	}
-
-	s.cfgSrc.ExternalIP = externalIP
-	s.cfgSrc.Management.ProbeTarget = probeTarget
-	s.cfgSrc.SkipCertVerify = skipCertVerify
-
-	// GeoIP settings
-	s.cfgSrc.GeoIP.Enabled = geoipEnabled
-	if geoipEnabled && s.cfgSrc.GeoIP.DatabasePath == "" {
-		s.cfgSrc.GeoIP.DatabasePath = "./GeoLite2-Country.mmdb"
-		s.cfgSrc.GeoIP.AutoUpdateEnabled = true
-		s.cfgSrc.GeoIP.AutoUpdateInterval = 24 * time.Hour
-	}
-
-	if logCfg != nil {
-		s.cfgSrc.Log.Output = logCfg.Output
-		if logCfg.MaxSize > 0 {
-			s.cfgSrc.Log.MaxSize = logCfg.MaxSize
-		}
-		if logCfg.MaxBackups > 0 {
-			s.cfgSrc.Log.MaxBackups = logCfg.MaxBackups
-		}
-		if logCfg.MaxAge > 0 {
-			s.cfgSrc.Log.MaxAge = logCfg.MaxAge
-		}
-		s.cfgSrc.Log.Compress = logCfg.Compress
-	}
-
-	if err := s.cfgSrc.SaveSettings(); err != nil {
-		return fmt.Errorf("保存配置失败: %w", err)
-	}
-	return nil
-}
-
 // Start launches the HTTP server.
 func (s *Server) Start(ctx context.Context) {
 	if s == nil || s.srv == nil {
 		return
 	}
-	s.logger.Printf("Starting monitor server on %s", s.cfg.Listen)
-	go func() {
-		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			s.logger.Printf("❌ Monitor server error: %v", err)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.startOnce.Do(func() {
+		if s.ctx.Err() != nil {
+			return
 		}
-	}()
-	// Give server a moment to start and check for immediate errors
-	time.Sleep(100 * time.Millisecond)
-	s.logger.Printf("✅ Monitor server started on http://%s", s.cfg.Listen)
-
-	go func() {
-		<-ctx.Done()
-		s.Shutdown(context.Background())
-	}()
+		listener, err := net.Listen("tcp", s.srv.Addr)
+		if err != nil {
+			s.logger.Printf("❌ Monitor server error: %v", err)
+			return
+		}
+		s.logger.Printf("✅ Monitor server started on http://%s", listener.Addr())
+		go s.cleanupExpiredSessions()
+		go func() {
+			if err := s.srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				s.logger.Printf("❌ Monitor server error: %v", err)
+			}
+		}()
+		go func() {
+			select {
+			case <-ctx.Done():
+				s.Shutdown(context.Background())
+			case <-s.ctx.Done():
+			}
+		}()
+	})
 }
 
 // Shutdown stops the server gracefully.
@@ -281,10 +285,36 @@ func (s *Server) Shutdown(ctx context.Context) {
 	if s == nil || s.srv == nil {
 		return
 	}
-	_ = s.srv.Shutdown(ctx)
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.trafficClient != nil {
+		s.trafficClient.CloseIdleConnections()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+	}
+	if err := s.srv.Shutdown(ctx); err != nil {
+		// Long-lived SSE streams need an explicit close after the drain budget.
+		_ = s.srv.Close()
+	}
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	data, err := embeddedFS.ReadFile("assets/index.html")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -427,12 +457,19 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Duration string `json:"duration"` // e.g. "1h", "24h", "30m"
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Duration == "" {
+		if r.ContentLength != 0 {
+			if err := decodeManagementJSON(w, r, 4096, &req); err != nil {
+				writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
+				return
+			}
+		}
+		if req.Duration == "" {
 			req.Duration = "24h"
 		}
 		duration, err := time.ParseDuration(req.Duration)
 		if err != nil || duration <= 0 {
-			duration = 24 * time.Hour
+			writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "duration 须为正数时间间隔"})
+			return
 		}
 		if err := s.mgr.ManualBlacklist(tag, duration); err != nil {
 			writeJSON(w, map[string]any{"error": err.Error()})
@@ -456,7 +493,7 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	flusher, ok := w.(http.Flusher)
+	_, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "SSE not supported", http.StatusInternalServerError)
 		return
@@ -467,8 +504,9 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	// not the others), so reject it cleanly instead.
 	if !s.probeAllInFlight.CompareAndSwap(false, true) {
 		busy, _ := json.Marshal(map[string]any{"type": "error", "message": "批量探测已在进行中，请稍候"})
-		fmt.Fprintf(w, "data: %s\n\n", busy)
-		flusher.Flush()
+		if err := writeSSE(w, busy); err != nil {
+			return
+		}
 		return
 	}
 	defer s.probeAllInFlight.Store(false)
@@ -478,27 +516,28 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	total := len(snapshots)
 	if total == 0 {
 		emptyData, _ := json.Marshal(map[string]any{"type": "complete", "total": 0, "success": 0, "failed": 0})
-		fmt.Fprintf(w, "data: %s\n\n", emptyData)
-		flusher.Flush()
+		if err := writeSSE(w, emptyData); err != nil {
+			return
+		}
 		return
 	}
 
 	// Send start event
 	startData, _ := json.Marshal(map[string]any{"type": "start", "total": total})
-	fmt.Fprintf(w, "data: %s\n\n", startData)
-	flusher.Flush()
+	if err := writeSSE(w, startData); err != nil {
+		return
+	}
 
 	// Read concurrency from the live config so WebUI changes take effect after
-	// a reload (no process restart required). A fresh semaphore is created per
-	// request to avoid mutating a shared one while probes are in flight.
+	// a reload (no process restart required). Workers are bounded per request
+	// rather than creating one waiting goroutine for every registered node.
 	concurrency := s.currentProbeConcurrency()
-	sem := semaphore.NewWeighted(concurrency)
 
 	// Create context with a timeout scaled to node count and concurrency so that
 	// large inventories (e.g. thousands of nodes) are not cut off. Each probe
 	// still has its own 10s deadline; here we bound the total wall time as
 	// ceil(total / concurrency) * perProbe + slack, which is the expected
-	// completion time given the semaphore. We deliberately do NOT cap this below
+	// completion time given the worker limit. We deliberately do NOT cap this below
 	// the estimate: a shorter deadline would cancel still-queued probes and
 	// report reachable nodes as failures (which can then blacklist them). The
 	// client can still abort early by closing the SSE connection (r.Context()).
@@ -514,57 +553,59 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), totalTimeout)
 	defer cancel()
 
-	// Probe all nodes with semaphore control
+	// Probe all nodes using a fixed-size worker pool
 	type probeResult struct {
 		tag     string
 		name    string
 		latency int64
 		err     string
 	}
-	results := make(chan probeResult, total)
+	workerCount := min(total, int(concurrency))
+	jobs := make(chan Snapshot)
+	results := make(chan probeResult, workerCount)
 	var wg sync.WaitGroup
-
-	// Launch probes with semaphore control
-	for _, snap := range snapshots {
+	for range workerCount {
 		wg.Add(1)
-		go func(snap Snapshot) {
+		go func() {
 			defer wg.Done()
-
-			// Acquire semaphore permit
-			if err := sem.Acquire(ctx, 1); err != nil {
-				results <- probeResult{
-					tag:  snap.Tag,
-					name: snap.Name,
-					err:  "probe cancelled: " + err.Error(),
+			for {
+				var snap Snapshot
+				select {
+				case <-ctx.Done():
+					return
+				case next, open := <-jobs:
+					if !open {
+						return
+					}
+					snap = next
 				}
+				probeCtx, probeCancel := context.WithTimeout(ctx, perProbe)
+				latency, err := s.mgr.Probe(probeCtx, snap.Tag)
+				probeCancel()
+				result := probeResult{tag: snap.Tag, name: snap.Name, latency: latency.Milliseconds()}
+				if err != nil {
+					result.latency, result.err = -1, err.Error()
+				} else if latency > 0 && result.latency == 0 {
+					result.latency = 1
+				}
+				select {
+				case results <- result:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, snap := range snapshots {
+			select {
+			case jobs <- snap:
+			case <-ctx.Done():
 				return
 			}
-			defer sem.Release(1)
-
-			// Execute probe
-			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
-			defer probeCancel()
-
-			latency, err := s.mgr.Probe(probeCtx, snap.Tag)
-			if err != nil {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: -1,
-					err:     err.Error(),
-				}
-			} else {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: latency.Milliseconds(),
-					err:     "",
-				}
-			}
-		}(snap)
-	}
-
-	// Wait for all probes to complete
+		}
+	}()
 	go func() {
 		wg.Wait()
 		close(results)
@@ -600,14 +641,26 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 			"progress": float64(count) / float64(total) * 100,
 		}
 		eventData, _ := json.Marshal(eventPayload)
-		fmt.Fprintf(w, "data: %s\n\n", eventData)
-		flusher.Flush()
+		if err := writeSSE(w, eventData); err != nil {
+			return
+		}
 	}
 
 	// Send complete event
 	completeData, _ := json.Marshal(map[string]any{"type": "complete", "total": total, "success": successCount, "failed": failedCount})
-	fmt.Fprintf(w, "data: %s\n\n", completeData)
-	flusher.Flush()
+	if err := writeSSE(w, completeData); err != nil {
+		return
+	}
+}
+
+// A stalled browser must not retain a probe batch or upstream traffic stream.
+func writeSSE(w http.ResponseWriter, data []byte) error {
+	controller := http.NewResponseController(w)
+	_ = controller.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return err
+	}
+	return controller.Flush()
 }
 
 func writeJSON(w http.ResponseWriter, payload any) {
@@ -615,94 +668,139 @@ func writeJSON(w http.ResponseWriter, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-// withAuth 认证中间件，如果配置了密码则需要验证
+// withAuth protects management endpoints and prevents browser cross-origin
+// mutation requests, including deployments intentionally configured without a password.
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 如果没有配置密码，直接放行
-		if s.cfg.Password == "" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if !sameOriginMutation(r) {
+			writeStatusJSON(w, http.StatusForbidden, map[string]any{"error": "跨站请求已拒绝"})
+			return
+		}
+		s.cfgMu.RLock()
+		password := s.cfg.Password
+		s.cfgMu.RUnlock()
+		if password == "" || s.validateSession(requestSessionToken(r)) {
 			next(w, r)
 			return
 		}
-
-		// 检查 Cookie 中的 session token
-		cookie, err := r.Cookie("session_token")
-		if err == nil && s.validateSession(cookie.Value) {
-			next(w, r)
-			return
-		}
-
-		// 检查 Authorization header (Bearer token)
-		authHeader := r.Header.Get("Authorization")
-		if authHeader != "" {
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if s.validateSession(token) {
-				next(w, r)
-				return
-			}
-		}
-
-		// 未授权
-		w.WriteHeader(http.StatusUnauthorized)
-		writeJSON(w, map[string]any{"error": "未授权，请先登录"})
+		writeStatusJSON(w, http.StatusUnauthorized, map[string]any{"error": "未授权，请先登录"})
 	}
 }
 
-// handleAuth 处理登录认证
+func sameOriginMutation(r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+		return true
+	}
+	if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // Non-browser API clients do not send Origin.
+	}
+	u, err := url.Parse(origin)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, r.Host)
+}
+
+func requestSessionToken(r *http.Request) string {
+	if header := r.Header.Get("Authorization"); header != "" {
+		scheme, token, ok := strings.Cut(header, " ")
+		if strings.EqualFold(scheme, "Bearer") {
+			if ok {
+				return token
+			}
+			return ""
+		}
+		// Reverse proxies may forward their own Basic/Digest authentication.
+		// Only an explicit Bearer token overrides the management login cookie.
+	}
+	if cookie, err := r.Cookie("session_token"); err == nil {
+		return cookie.Value
+	}
+	return ""
+}
+
+// setPasswordLocked updates live authentication and revokes old login sessions.
+// The caller holds cfgMu; the lock order is cfgMu -> sessionMu everywhere.
+func (s *Server) setPasswordLocked(password string) bool {
+	if password == s.cfg.Password {
+		return false
+	}
+	s.cfg.Password = password
+	s.sessionMu.Lock()
+	s.sessions = make(map[string]*Session)
+	s.sessionMu.Unlock()
+	return true
+}
+
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
-	// 如果没有配置密码，直接返回成功（不需要token）
-	if s.cfg.Password == "" {
-		writeJSON(w, map[string]any{"message": "无需密码", "no_password": true})
+	w.Header().Set("Cache-Control", "no-store")
+	if !sameOriginMutation(r) {
+		writeStatusJSON(w, http.StatusForbidden, map[string]any{"error": "跨站请求已拒绝"})
 		return
 	}
-
-	if r.Method != http.MethodPost {
+	if r.Method == http.MethodDelete {
+		s.sessionMu.Lock()
+		delete(s.sessions, requestSessionToken(r))
+		s.sessionMu.Unlock()
+		http.SetCookie(w, &http.Cookie{Name: "session_token", Path: "/", HttpOnly: true,
+			Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+		writeJSON(w, map[string]any{"message": "已退出登录"})
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-
+	s.cfgMu.RLock()
+	password := s.cfg.Password
+	s.cfgMu.RUnlock()
+	if r.Method == http.MethodGet || password == "" {
+		writeJSON(w, map[string]any{"no_password": password == "", "authenticated": password == "" || s.validateSession(requestSessionToken(r))})
+		return
+	}
 	var req struct {
 		Password string `json:"password"`
 	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "请求格式错误"})
+	if err := decodeManagementJSON(w, r, 4096, &req); err != nil {
+		writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
 		return
 	}
-
-	// 使用 constant-time 比较防止时序攻击
-	if !secureCompareStrings(req.Password, s.cfg.Password) {
-		// 添加随机延迟防止暴力破解
-		time.Sleep(time.Duration(100+mathrand.Intn(200)) * time.Millisecond)
-		w.WriteHeader(http.StatusUnauthorized)
-		writeJSON(w, map[string]any{"error": "密码错误"})
+	if !secureCompareStrings(req.Password, password) {
+		// Bound a failed attempt while allowing a disconnected request to stop immediately.
+		timer := time.NewTimer(time.Duration(100+mathrand.Intn(200)) * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-r.Context().Done():
+			return
+		}
+		writeStatusJSON(w, http.StatusUnauthorized, map[string]any{"error": "密码错误"})
 		return
 	}
-
-	// 创建新会话
+	// Do not mint a session for an old password after a concurrent password rotation.
+	s.cfgMu.RLock()
+	if password != s.cfg.Password {
+		s.cfgMu.RUnlock()
+		writeStatusJSON(w, http.StatusUnauthorized, map[string]any{"error": "密码已更新，请重新登录"})
+		return
+	}
 	session, err := s.createSession()
+	s.cfgMu.RUnlock()
 	if err != nil {
 		s.logger.Printf("Failed to create session: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		writeJSON(w, map[string]any{"error": "服务器错误"})
+		writeStatusJSON(w, http.StatusInternalServerError, map[string]any{"error": "服务器错误"})
 		return
 	}
-
-	// 设置 HttpOnly Cookie
 	http.SetCookie(w, &http.Cookie{
-		Name:     "session_token",
-		Value:    session.Token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   false, // 生产环境应启用 HTTPS 并设为 true
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   int(s.sessionTTL.Seconds()),
+		Name: "session_token", Value: session.Token, Path: "/", HttpOnly: true,
+		Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode,
+		MaxAge: int(s.sessionTTL.Seconds()),
 	})
-
-	writeJSON(w, map[string]any{
-		"message": "登录成功",
-		"token":   session.Token,
-	})
+	writeJSON(w, map[string]any{"message": "登录成功", "token": session.Token})
 }
 
 // handleExport 导出所有可用代理池节点的代理 URI，每行一个。
@@ -744,125 +842,88 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 	seen := make(map[string]bool)
 
-	// 读取运行模式和监听配置
+	// Snapshot settings once so an export cannot mix credentials from two
+	// concurrent settings updates, or borrow per-node credentials for the pool.
 	s.cfgMu.RLock()
 	mode := ""
+	externalIP := s.cfg.ExternalIP
+	username, password := s.cfg.ProxyUsername, s.cfg.ProxyPassword
 	var listenerCfg config.ListenerConfig
 	var geoipCfg config.GeoIPConfig
 	if s.cfgSrc != nil {
 		mode = s.cfgSrc.Mode
+		externalIP = s.cfgSrc.ExternalIP
 		listenerCfg = s.cfgSrc.Listener
 		geoipCfg = s.cfgSrc.GeoIP
+		if mode == "hybrid" || mode == "multi-port" {
+			username, password = s.cfgSrc.MultiPort.Username, s.cfgSrc.MultiPort.Password
+		} else {
+			username, password = listenerCfg.Username, listenerCfg.Password
+		}
 	}
 	s.cfgMu.RUnlock()
 
-	// Pool 代理池入口（pool 或 hybrid 模式）
-	if (mode == "pool" || mode == "hybrid") && listenerCfg.Port > 0 {
-		poolAddr := listenerCfg.Address
-		if poolAddr == "" || poolAddr == "0.0.0.0" || poolAddr == "::" {
-			if extIP, _, _, _ := s.getSettings(); extIP != "" {
-				poolAddr = extIP
-			}
+	exportHost := func(address string) string {
+		if externalIP != "" {
+			return proxyLinkHost(externalIP, r)
 		}
-		var poolAuth string
-		if listenerCfg.Username != "" && listenerCfg.Password != "" {
-			poolAuth = fmt.Sprintf("%s:%s@", listenerCfg.Username, listenerCfg.Password)
+		// Preserve a concrete listen address, but replace unspecified IPv4/IPv6
+		// addresses with the request host rather than exporting a wildcard.
+		return proxyLinkHost(address, r)
+	}
+	appendURI := func(protocol, address string, port uint16, user, pass string) {
+		link := url.URL{Scheme: protocol, Host: net.JoinHostPort(exportHost(address), strconv.Itoa(int(port)))}
+		if user != "" {
+			link.User = url.UserPassword(user, pass)
 		}
-		lines = append(lines, "# Pool 代理池入口")
-		poolHTTP := fmt.Sprintf("http://%s%s:%d", poolAuth, poolAddr, listenerCfg.Port)
-		poolSocks := fmt.Sprintf("socks5://%s%s:%d", poolAuth, poolAddr, listenerCfg.Port)
-		switch scheme {
-		case "http":
-			lines = append(lines, poolHTTP)
-			seen[poolHTTP] = true
-		case "socks5":
-			lines = append(lines, poolSocks)
-			seen[poolSocks] = true
-		case "all":
-			lines = append(lines, poolHTTP)
-			seen[poolHTTP] = true
-			lines = append(lines, poolSocks)
-			seen[poolSocks] = true
+		uri := link.String()
+		if !seen[uri] {
+			lines = append(lines, uri)
+			seen[uri] = true
+		}
+	}
+	appendProxySchemes := func(address string, port uint16, user, pass string) {
+		if scheme == "http" || scheme == "all" {
+			appendURI("http", address, port, user, pass)
+		}
+		if scheme == "socks5" || scheme == "all" {
+			appendURI("socks5", address, port, user, pass)
 		}
 	}
 
-	// GeoIP 分区路由入口
+	// Pool 代理池入口（pool 或 hybrid 模式）
+	if (mode == "pool" || mode == "hybrid") && listenerCfg.Port > 0 {
+		lines = append(lines, "# Pool 代理池入口")
+		appendProxySchemes(listenerCfg.Address, listenerCfg.Port, listenerCfg.Username, listenerCfg.Password)
+	}
+
+	// GeoIP 分区路由入口（保持其仅支持 HTTP 的导出行为）
 	if geoipCfg.Enabled && geoipCfg.Port > 0 {
-		geoAddr := geoipCfg.Listen
-		if geoAddr == "" || geoAddr == "0.0.0.0" || geoAddr == "::" {
-			if extIP, _, _, _ := s.getSettings(); extIP != "" {
-				geoAddr = extIP
-			}
-		}
-		var geoAuth string
-		if listenerCfg.Username != "" && listenerCfg.Password != "" {
-			geoAuth = fmt.Sprintf("%s:%s@", listenerCfg.Username, listenerCfg.Password)
-		}
 		regions := geoip.AllRegions()
 		var pathParts []string
-		for _, r := range regions {
-			if r != "other" {
-				pathParts = append(pathParts, fmt.Sprintf("/%s/", r))
+		for _, region := range regions {
+			if region != "other" {
+				pathParts = append(pathParts, fmt.Sprintf("/%s/", region))
 			}
 		}
 		lines = append(lines, fmt.Sprintf("# GeoIP 分区路由入口 (支持路径: %s)", strings.Join(pathParts, " ")))
-		// GeoIP 路由仅支持 HTTP
-		geoURI := fmt.Sprintf("http://%s%s:%d", geoAuth, geoAddr, geoipCfg.Port)
-		if !seen[geoURI] {
-			lines = append(lines, geoURI)
-			seen[geoURI] = true
-		}
+		appendURI("http", geoipCfg.Listen, geoipCfg.Port, listenerCfg.Username, listenerCfg.Password)
 	}
 
-	// Multi-port 独立节点
+	// Multi-port 独立节点，使用独立入口凭据，与 hybrid 的 pool 凭据区分。
 	if len(snapshots) > 0 && (mode == "hybrid" || mode == "multi-port" || mode == "") {
 		lines = append(lines, "# Multi-port 独立节点")
 	}
 	for _, snap := range snapshots {
-		// 只导出有监听地址和端口的节点
 		if snap.ListenAddress == "" || snap.Port == 0 {
 			continue
 		}
-
-		listenAddr := snap.ListenAddress
-		if listenAddr == "0.0.0.0" || listenAddr == "::" {
-			if extIP, _, _, _ := s.getSettings(); extIP != "" {
-				listenAddr = extIP
-			}
-		}
-
-		var authPart string
-		if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
-			authPart = fmt.Sprintf("%s:%s@", s.cfg.ProxyUsername, s.cfg.ProxyPassword)
-		}
-		httpURI := fmt.Sprintf("http://%s%s:%d", authPart, listenAddr, snap.Port)
-		socksURI := fmt.Sprintf("socks5://%s%s:%d", authPart, listenAddr, snap.Port)
-
-		switch scheme {
-		case "http":
-			if !seen[httpURI] {
-				lines = append(lines, httpURI)
-				seen[httpURI] = true
-			}
-		case "socks5":
-			if !seen[socksURI] {
-				lines = append(lines, socksURI)
-				seen[socksURI] = true
-			}
-		case "all":
-			if !seen[httpURI] {
-				lines = append(lines, httpURI)
-				seen[httpURI] = true
-			}
-			if !seen[socksURI] {
-				lines = append(lines, socksURI)
-				seen[socksURI] = true
-			}
-		}
+		appendProxySchemes(snap.ListenAddress, snap.Port, username, password)
 	}
 
 	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	filename := "proxy_pool.txt"
 	if scheme == "socks5" {
 		filename = "proxy_pool_socks5.txt"
@@ -880,11 +941,16 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		extIP, probeTarget, skipCertVerify, logCfg := s.getSettings()
-
-		// Read full config for extended fields
+		// One snapshot prevents mixing fields from concurrent settings saves.
 		s.cfgMu.RLock()
-		cfg := s.cfgSrc
+		extIP, probeTarget, skipCertVerify := s.cfg.ExternalIP, s.cfg.ProbeTarget, s.cfg.SkipCertVerify
+		var logCfg config.LogConfig
+		var cfg *config.Config
+		if s.cfgSrc != nil {
+			snapshot := s.cfgSrc.SettingsSnapshot()
+			cfg = &snapshot
+			logCfg = snapshot.Log
+		}
 		s.cfgMu.RUnlock()
 
 		resp := map[string]any{
@@ -930,8 +996,11 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"rate_limit_cooldown": cfg.Pool.RateLimitCooldown.String(),
 			}
 			resp["sticky"] = map[string]any{
-				"enabled": cfg.Sticky.Enabled,
-				"port":    cfg.Sticky.Port,
+				"enabled":         cfg.Sticky.Enabled,
+				"port":            cfg.Sticky.Port,
+				"session_enabled": cfg.Sticky.SessionRoutingEnabled(),
+				"session_ttl":     cfg.Sticky.SessionTTLOrDefault().String(),
+				"max_sessions":    cfg.Sticky.MaxSessionsOrDefault(),
 			}
 			resp["management"] = map[string]any{
 				"listen":            cfg.Management.Listen,
@@ -950,10 +1019,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, resp)
 	case http.MethodPut:
 		var req struct {
-			ExternalIP     string `json:"external_ip"`
-			ProbeTarget    string `json:"probe_target"`
-			SkipCertVerify bool   `json:"skip_cert_verify"`
-			Mode           string `json:"mode,omitempty"`
+			ExternalIP     *string `json:"external_ip"`
+			ProbeTarget    *string `json:"probe_target"`
+			SkipCertVerify *bool   `json:"skip_cert_verify"`
+			Mode           string  `json:"mode,omitempty"`
 			Listener       *struct {
 				Address  string `json:"address"`
 				Port     uint16 `json:"port"`
@@ -974,8 +1043,11 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				RateLimitCooldown string `json:"rate_limit_cooldown"`
 			} `json:"pool,omitempty"`
 			Sticky *struct {
-				Enabled bool   `json:"enabled"`
-				Port    uint16 `json:"port"`
+				Enabled        *bool   `json:"enabled"`
+				Port           *uint16 `json:"port"`
+				SessionEnabled *bool   `json:"session_enabled"`
+				SessionTTL     *string `json:"session_ttl"`
+				MaxSessions    *int    `json:"max_sessions"`
 			} `json:"sticky,omitempty"`
 			Management *struct {
 				Listen           string `json:"listen"`
@@ -998,103 +1070,209 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				AutoUpdateInterval string `json:"auto_update_interval"`
 			} `json:"geoip"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			writeJSON(w, map[string]any{"error": "请求格式错误"})
+		if err := decodeManagementJSON(w, r, 1<<20, &req); err != nil {
+			writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
 			return
 		}
 
-		extIP := strings.TrimSpace(req.ExternalIP)
-		probeTarget := strings.TrimSpace(req.ProbeTarget)
+		var durationInputs []struct{ name, value string }
+		if req.Pool != nil {
+			durationInputs = append(durationInputs,
+				struct{ name, value string }{"pool.blacklist_duration", req.Pool.BlacklistDuration},
+				struct{ name, value string }{"pool.transient_cooldown", req.Pool.TransientCooldown},
+				struct{ name, value string }{"pool.rate_limit_cooldown", req.Pool.RateLimitCooldown})
+		}
+		for _, input := range durationInputs {
+			if input.value == "" {
+				continue
+			}
+			if duration, err := time.ParseDuration(input.value); err != nil || duration <= 0 {
+				writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": input.name + " 须为正数时间间隔"})
+				return
+			}
+		}
+		if req.Management != nil && req.Management.ProbeConcurrency < 0 {
+			writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "management.probe_concurrency 须为非负整数"})
+			return
+		}
+		if req.Log != nil && (req.Log.MaxSize < 0 || req.Log.MaxBackups < 0 || req.Log.MaxAge < 0) {
+			writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "日志轮转参数须为非负整数"})
+			return
+		}
 
-		var logCfg *config.LogConfig
-		if req.Log != nil {
-			logCfg = &config.LogConfig{
-				Output:     req.Log.Output,
-				MaxSize:    req.Log.MaxSize,
-				MaxBackups: req.Log.MaxBackups,
-				MaxAge:     req.Log.MaxAge,
-				Compress:   req.Log.Compress,
+		var geoUpdateInterval time.Duration
+		if req.GeoIP != nil && req.GeoIP.AutoUpdateInterval != "" {
+			var err error
+			geoUpdateInterval, err = time.ParseDuration(req.GeoIP.AutoUpdateInterval)
+			if err != nil || geoUpdateInterval < 0 || (geoUpdateInterval == 0 && req.GeoIP.AutoUpdateEnabled) {
+				writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "geoip.auto_update_interval 须为有效时间间隔，开启自动更新时须大于 0"})
+				return
+			}
+			if geoUpdateInterval == 0 {
+				geoUpdateInterval = 24 * time.Hour // Legacy disabled-feature GET/PUT round-trip.
 			}
 		}
 
-		if err := s.updateSettings(extIP, probeTarget, req.SkipCertVerify, logCfg, req.GeoIP != nil && req.GeoIP.Enabled); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			writeJSON(w, map[string]any{"error": err.Error()})
-			return
+		// Validate session settings before touching either the live config or disk.
+		var sessionTTL time.Duration
+		if req.Sticky != nil {
+			if req.Sticky.SessionTTL != nil {
+				var err error
+				sessionTTL, err = time.ParseDuration(*req.Sticky.SessionTTL)
+				if err != nil || sessionTTL <= 0 || sessionTTL > config.MaxSessionTTL {
+					writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "sticky.session_ttl 必须为大于 0 且不超过 8760h 的时间间隔"})
+					return
+				}
+			}
+			if req.Sticky.MaxSessions != nil && (*req.Sticky.MaxSessions < 1 || *req.Sticky.MaxSessions > config.MaxSessionCapacity) {
+				writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("sticky.max_sessions 必须在 1 到 %d 之间", config.MaxSessionCapacity)})
+				return
+			}
 		}
 
-		// Update extended settings
+		// Stage all updates in a value copy. A failed save leaves runtime settings
+		// untouched, and a successful response corresponds to exactly one save.
+		if locker, ok := s.nodeManager().(settingsLocker); ok {
+			unlock := locker.LockSettings()
+			defer unlock()
+		}
 		s.cfgMu.Lock()
-		if s.cfgSrc != nil {
-			if req.Mode != "" {
-				s.cfgSrc.Mode = req.Mode
-			}
-			if req.Listener != nil {
-				s.cfgSrc.Listener.Address = req.Listener.Address
-				s.cfgSrc.Listener.Port = req.Listener.Port
-				s.cfgSrc.Listener.Username = req.Listener.Username
-				s.cfgSrc.Listener.Password = req.Listener.Password
-			}
-			if req.MultiPort != nil {
-				s.cfgSrc.MultiPort.Address = req.MultiPort.Address
-				s.cfgSrc.MultiPort.BasePort = req.MultiPort.BasePort
-				s.cfgSrc.MultiPort.Username = req.MultiPort.Username
-				s.cfgSrc.MultiPort.Password = req.MultiPort.Password
-			}
-			if req.Pool != nil {
-				s.cfgSrc.Pool.Mode = req.Pool.Mode
-				s.cfgSrc.Pool.FailureThreshold = req.Pool.FailureThreshold
-				if req.Pool.BlacklistDuration != "" {
-					if d, err := time.ParseDuration(req.Pool.BlacklistDuration); err == nil {
-						s.cfgSrc.Pool.BlacklistDuration = d
-					}
-				}
-				// Invalid or non-positive cooldowns keep the current setting rather
-				// than failing the whole settings update.
-				if req.Pool.TransientCooldown != "" {
-					if d, err := time.ParseDuration(req.Pool.TransientCooldown); err == nil && d > 0 {
-						s.cfgSrc.Pool.TransientCooldown = d
-					}
-				}
-				if req.Pool.RateLimitCooldown != "" {
-					if d, err := time.ParseDuration(req.Pool.RateLimitCooldown); err == nil && d > 0 {
-						s.cfgSrc.Pool.RateLimitCooldown = d
-					}
-				}
-			}
-			if req.Sticky != nil {
-				s.cfgSrc.Sticky.Enabled = req.Sticky.Enabled
-				s.cfgSrc.Sticky.Port = req.Sticky.Port
-			}
-			if req.Management != nil {
-				s.cfgSrc.Management.Listen = req.Management.Listen
-				s.cfgSrc.Management.Password = req.Management.Password
-				if req.Management.ProbeConcurrency > 0 {
-					s.cfgSrc.Management.ProbeConcurrency = req.Management.ProbeConcurrency
+		if s.cfgSrc == nil {
+			s.cfgMu.Unlock()
+			writeStatusJSON(w, http.StatusInternalServerError, map[string]any{"error": "配置存储未初始化"})
+			return
+		}
+		candidate := s.cfgSrc.SettingsSnapshot()
+		if req.ExternalIP != nil {
+			candidate.ExternalIP = strings.TrimSpace(*req.ExternalIP)
+		}
+		if req.ProbeTarget != nil {
+			candidate.Management.ProbeTarget = strings.TrimSpace(*req.ProbeTarget)
+		}
+		if req.SkipCertVerify != nil {
+			candidate.SkipCertVerify = *req.SkipCertVerify
+		}
+		if req.Mode != "" {
+			candidate.Mode = req.Mode
+		}
+		if req.Listener != nil {
+			candidate.Listener.Address = req.Listener.Address
+			candidate.Listener.Port = req.Listener.Port
+			candidate.Listener.Username = req.Listener.Username
+			candidate.Listener.Password = req.Listener.Password
+		}
+		if req.MultiPort != nil {
+			candidate.MultiPort.Address = req.MultiPort.Address
+			candidate.MultiPort.BasePort = req.MultiPort.BasePort
+			candidate.MultiPort.Username = req.MultiPort.Username
+			candidate.MultiPort.Password = req.MultiPort.Password
+		}
+		if req.Pool != nil {
+			candidate.Pool.Mode = req.Pool.Mode
+			candidate.Pool.FailureThreshold = req.Pool.FailureThreshold
+			if req.Pool.BlacklistDuration != "" {
+				if d, err := time.ParseDuration(req.Pool.BlacklistDuration); err == nil {
+					candidate.Pool.BlacklistDuration = d
 				}
 			}
-			if req.GeoIP != nil {
-				s.cfgSrc.GeoIP.DatabasePath = req.GeoIP.DatabasePath
-				s.cfgSrc.GeoIP.Listen = req.GeoIP.Listen
-				s.cfgSrc.GeoIP.Port = req.GeoIP.Port
-				s.cfgSrc.GeoIP.AutoUpdateEnabled = req.GeoIP.AutoUpdateEnabled
-				if req.GeoIP.AutoUpdateInterval != "" {
-					if d, err := time.ParseDuration(req.GeoIP.AutoUpdateInterval); err == nil {
-						s.cfgSrc.GeoIP.AutoUpdateInterval = d
-					}
-				}
+			// Retain the existing API behavior for legacy cooldown fields.
+			if d, err := time.ParseDuration(req.Pool.TransientCooldown); err == nil && d > 0 {
+				candidate.Pool.TransientCooldown = d
 			}
-			_ = s.cfgSrc.SaveSettings()
+			if d, err := time.ParseDuration(req.Pool.RateLimitCooldown); err == nil && d > 0 {
+				candidate.Pool.RateLimitCooldown = d
+			}
+		}
+		if req.Sticky != nil {
+			if req.Sticky.Enabled != nil {
+				candidate.Sticky.Enabled = *req.Sticky.Enabled
+			}
+			if req.Sticky.Port != nil {
+				candidate.Sticky.Port = *req.Sticky.Port
+			}
+			if req.Sticky.SessionEnabled != nil {
+				candidate.Sticky.SessionEnabled = req.Sticky.SessionEnabled
+			}
+			if req.Sticky.SessionTTL != nil {
+				candidate.Sticky.SessionTTL = sessionTTL
+			}
+			if req.Sticky.MaxSessions != nil {
+				candidate.Sticky.MaxSessions = *req.Sticky.MaxSessions
+			}
+		}
+		if req.Management != nil {
+			candidate.Management.Listen = req.Management.Listen
+			candidate.Management.Password = req.Management.Password
+			if req.Management.ProbeConcurrency > 0 {
+				candidate.Management.ProbeConcurrency = req.Management.ProbeConcurrency
+			}
+		}
+		if req.Log != nil {
+			candidate.Log.Output = req.Log.Output
+			if req.Log.MaxSize > 0 {
+				candidate.Log.MaxSize = req.Log.MaxSize
+			}
+			if req.Log.MaxBackups > 0 {
+				candidate.Log.MaxBackups = req.Log.MaxBackups
+			}
+			if req.Log.MaxAge > 0 {
+				candidate.Log.MaxAge = req.Log.MaxAge
+			}
+			candidate.Log.Compress = req.Log.Compress
+		}
+		if req.GeoIP != nil {
+			candidate.GeoIP.Enabled = req.GeoIP.Enabled
+			candidate.GeoIP.DatabasePath = req.GeoIP.DatabasePath
+			candidate.GeoIP.Listen = req.GeoIP.Listen
+			candidate.GeoIP.Port = req.GeoIP.Port
+			candidate.GeoIP.AutoUpdateEnabled = req.GeoIP.AutoUpdateEnabled
+			if geoUpdateInterval > 0 {
+				candidate.GeoIP.AutoUpdateInterval = geoUpdateInterval
+			} else if candidate.GeoIP.AutoUpdateInterval <= 0 {
+				candidate.GeoIP.AutoUpdateInterval = 24 * time.Hour
+			}
+			if candidate.GeoIP.Enabled && candidate.GeoIP.DatabasePath == "" {
+				candidate.GeoIP.DatabasePath = "./GeoLite2-Country.mmdb"
+			}
+		}
+		if err := candidate.ValidateManagementSettings(); err != nil {
+			s.cfgMu.Unlock()
+			writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := candidate.SaveManagementSettings(); err != nil {
+			s.cfgMu.Unlock()
+			writeStatusJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("保存配置失败: %v", err)})
+			return
+		}
+		// Publish only settings-owned fields. Node and subscription managers own
+		// the remaining fields and may have updated them during the file save.
+		authChanged := s.setPasswordLocked(candidate.Management.Password)
+		s.cfgSrc.ExternalIP = candidate.ExternalIP
+		s.cfgSrc.Management = candidate.Management
+		s.cfgSrc.SkipCertVerify = candidate.SkipCertVerify
+		s.cfgSrc.Log = candidate.Log
+		s.cfgSrc.GeoIP = candidate.GeoIP
+		s.cfgSrc.Mode = candidate.Mode
+		s.cfgSrc.Listener = candidate.Listener
+		s.cfgSrc.MultiPort = candidate.MultiPort
+		s.cfgSrc.Pool = candidate.Pool
+		s.cfgSrc.Sticky = candidate.Sticky
+		s.cfg.ExternalIP = candidate.ExternalIP
+		s.cfg.ProbeTarget = candidate.Management.ProbeTarget
+		s.cfg.SkipCertVerify = candidate.SkipCertVerify
+		if s.routingStore != nil {
+			s.routingStore.Configure(candidate.Sticky.MaxSessionsOrDefault(), candidate.Sticky.SessionTTLOrDefault())
 		}
 		s.cfgMu.Unlock()
 
 		writeJSON(w, map[string]any{
 			"message":          "设置已保存",
-			"external_ip":      extIP,
-			"probe_target":     probeTarget,
-			"skip_cert_verify": req.SkipCertVerify,
+			"external_ip":      candidate.ExternalIP,
+			"probe_target":     candidate.Management.ProbeTarget,
+			"skip_cert_verify": candidate.SkipCertVerify,
 			"need_reload":      true,
+			"auth_changed":     authChanged,
 		})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1103,12 +1281,13 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 // handleSubscriptionStatus returns the current subscription refresh status.
 func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request) {
+	refresher := s.subscriptionRefresher()
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	if s.subRefresher == nil {
+	if refresher == nil {
 		writeJSON(w, map[string]any{
 			"enabled": false,
 			"message": "订阅刷新未启用",
@@ -1116,7 +1295,7 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	status := s.subRefresher.Status()
+	status := refresher.Status()
 	writeJSON(w, map[string]any{
 		"enabled":        true,
 		"last_refresh":   status.LastRefresh,
@@ -1129,26 +1308,38 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func contextualRefresher(refresher SubscriptionRefresher) (contextualSubscriptionRefresher, bool) {
+	contextual, ok := refresher.(contextualSubscriptionRefresher)
+	return contextual, ok
+}
+
 // handleSubscriptionRefresh triggers an immediate subscription refresh.
 func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Request) {
+	refresher := s.subscriptionRefresher()
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	if s.subRefresher == nil {
+	if refresher == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		writeJSON(w, map[string]any{"error": "订阅刷新未启用"})
 		return
 	}
 
-	if err := s.subRefresher.RefreshNow(); err != nil {
+	var refreshErr error
+	if contextual, ok := contextualRefresher(refresher); ok {
+		refreshErr = contextual.RefreshNowContext(r.Context())
+	} else {
+		refreshErr = refresher.RefreshNow()
+	}
+	if err := refreshErr; err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		writeJSON(w, map[string]any{"error": err.Error()})
 		return
 	}
 
-	status := s.subRefresher.Status()
+	status := refresher.Status()
 	writeJSON(w, map[string]any{
 		"message":    "刷新成功",
 		"node_count": status.NodeCount,
@@ -1157,6 +1348,7 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 
 // handleSubscriptionConfig handles GET/PUT for subscription configuration.
 func (s *Server) handleSubscriptionConfig(w http.ResponseWriter, r *http.Request) {
+	refresher := s.subscriptionRefresher()
 	switch r.Method {
 	case http.MethodGet:
 		s.cfgMu.RLock()
@@ -1164,7 +1356,7 @@ func (s *Server) handleSubscriptionConfig(w http.ResponseWriter, r *http.Request
 		var enabled bool
 		var interval string
 		if s.cfgSrc != nil {
-			urls = s.cfgSrc.Subscriptions
+			urls = append([]string(nil), s.cfgSrc.Subscriptions...)
 			enabled = s.cfgSrc.SubscriptionRefresh.Enabled
 			interval = s.cfgSrc.SubscriptionRefresh.Interval.String()
 		}
@@ -1181,46 +1373,77 @@ func (s *Server) handleSubscriptionConfig(w http.ResponseWriter, r *http.Request
 			Enabled       bool     `json:"enabled"`
 			Interval      string   `json:"interval"` // e.g. "1h", "30m"
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeManagementJSON(w, r, 1<<20, &req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			writeJSON(w, map[string]any{"error": "请求格式错误"})
 			return
 		}
 
-		// Parse interval
-		interval, err := time.ParseDuration(req.Interval)
-		if err != nil || interval < 5*time.Minute {
-			interval = 1 * time.Hour // default
-		}
-
-		// Clean URLs
-		var cleanURLs []string
-		for _, u := range req.Subscriptions {
-			u = strings.TrimSpace(u)
-			if u != "" {
-				cleanURLs = append(cleanURLs, u)
-			}
-		}
-
-		// Update in-memory config and persist to disk
-		s.cfgMu.Lock()
-		if s.cfgSrc != nil {
-			s.cfgSrc.Subscriptions = cleanURLs
-			s.cfgSrc.SubscriptionRefresh.Enabled = req.Enabled
-			s.cfgSrc.SubscriptionRefresh.Interval = interval
-			// Always persist to disk regardless of subscription manager state
-			if err := s.cfgSrc.SaveSettings(); err != nil {
-				s.cfgMu.Unlock()
-				w.WriteHeader(http.StatusInternalServerError)
-				writeJSON(w, map[string]any{"error": fmt.Sprintf("保存配置失败: %v", err)})
+		interval := time.Hour
+		if req.Interval != "" {
+			var err error
+			interval, err = time.ParseDuration(req.Interval)
+			if err != nil || interval < 5*time.Minute {
+				writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "interval 须为不少于 5m 的时间间隔"})
 				return
 			}
 		}
+		var cleanURLs []string
+		seenURLs := make(map[string]bool)
+		for _, raw := range req.Subscriptions {
+			u := strings.TrimSpace(raw)
+			if u == "" {
+				continue
+			}
+			parsed, err := url.Parse(u)
+			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
+				writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "订阅地址须为有效的 HTTP 或 HTTPS URL"})
+				return
+			}
+			if !seenURLs[u] {
+				cleanURLs = append(cleanURLs, u)
+				seenURLs[u] = true
+			}
+		}
+
+		// Stage and save only subscription-owned fields. Save failures must not
+		// alter runtime state or overwrite concurrent settings/node changes.
+		unlock := func() {}
+		if locker, ok := s.nodeManager().(settingsLocker); ok {
+			unlock = locker.LockSettings()
+		}
+		s.cfgMu.Lock()
+		if s.cfgSrc == nil {
+			s.cfgMu.Unlock()
+			unlock()
+			writeStatusJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "配置存储未初始化"})
+			return
+		}
+		candidate := s.cfgSrc.SettingsSnapshot()
+		candidate.Subscriptions = cleanURLs
+		candidate.SubscriptionRefresh = s.cfgSrc.SubscriptionRefresh
+		candidate.SubscriptionRefresh.Enabled = req.Enabled
+		candidate.SubscriptionRefresh.Interval = interval
+		if err := candidate.SaveSubscriptionSettings(); err != nil {
+			s.cfgMu.Unlock()
+			unlock()
+			writeStatusJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("保存配置失败: %v", err)})
+			return
+		}
+		s.cfgSrc.Subscriptions = append([]string(nil), candidate.Subscriptions...)
+		s.cfgSrc.SubscriptionRefresh = candidate.SubscriptionRefresh
 		s.cfgMu.Unlock()
+		unlock() // Refresh may invoke reload, which requires the same manager lock.
 
 		// Hot-reload subscription manager and wait for refresh to complete
-		if s.subRefresher != nil {
-			if err := s.subRefresher.UpdateConfigAndRefresh(cleanURLs, req.Enabled, interval); err != nil {
+		if refresher != nil {
+			var refreshErr error
+			if contextual, ok := contextualRefresher(refresher); ok {
+				refreshErr = contextual.UpdateConfigAndRefreshContext(r.Context(), cleanURLs, req.Enabled, interval)
+			} else {
+				refreshErr = refresher.UpdateConfigAndRefresh(cleanURLs, req.Enabled, interval)
+			}
+			if err := refreshErr; err != nil {
 				// Config was saved but refresh failed — report partial success
 				writeJSON(w, map[string]any{
 					"message":       fmt.Sprintf("订阅配置已保存，但刷新失败: %v", err),
@@ -1233,7 +1456,10 @@ func (s *Server) handleSubscriptionConfig(w http.ResponseWriter, r *http.Request
 			}
 		}
 
-		status := s.subRefresher.Status()
+		status := SubscriptionStatus{}
+		if refresher != nil {
+			status = refresher.Status()
+		}
 		writeJSON(w, map[string]any{
 			"message":       "订阅配置已更新并生效",
 			"subscriptions": cleanURLs,
@@ -1268,13 +1494,14 @@ func (p nodePayload) toConfig() config.NodeConfig {
 
 // handleConfigNodes handles GET (list) and POST (create) for config nodes.
 func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
-	if !s.ensureNodeManager(w) {
+	nodeMgr := s.nodeManager()
+	if !ensureNodeManager(w, nodeMgr) {
 		return
 	}
 
 	switch r.Method {
 	case http.MethodGet:
-		nodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+		nodes, err := nodeMgr.ListConfigNodes(r.Context())
 		if err != nil {
 			s.respondNodeError(w, err)
 			return
@@ -1282,12 +1509,12 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"nodes": nodes})
 	case http.MethodPost:
 		var payload nodePayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := decodeManagementJSON(w, r, 1<<20, &payload); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			writeJSON(w, map[string]any{"error": "请求格式错误"})
 			return
 		}
-		node, err := s.nodeMgr.CreateNode(r.Context(), payload.toConfig())
+		node, err := nodeMgr.CreateNode(r.Context(), payload.toConfig())
 		if err != nil {
 			s.respondNodeError(w, err)
 			return
@@ -1300,11 +1527,12 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 
 // handleConfigNodeItem handles PUT (update) and DELETE for a specific config node.
 func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
-	if !s.ensureNodeManager(w) {
+	nodeMgr := s.nodeManager()
+	if !ensureNodeManager(w, nodeMgr) {
 		return
 	}
 
-	namePart := strings.TrimPrefix(r.URL.Path, "/api/nodes/config/")
+	namePart := strings.TrimPrefix(r.URL.EscapedPath(), "/api/nodes/config/")
 	nodeName, err := url.PathUnescape(namePart)
 	if err != nil || nodeName == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1315,19 +1543,19 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
 		var payload nodePayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := decodeManagementJSON(w, r, 1<<20, &payload); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			writeJSON(w, map[string]any{"error": "请求格式错误"})
 			return
 		}
-		node, err := s.nodeMgr.UpdateNode(r.Context(), nodeName, payload.toConfig())
+		node, err := nodeMgr.UpdateNode(r.Context(), nodeName, payload.toConfig())
 		if err != nil {
 			s.respondNodeError(w, err)
 			return
 		}
 		writeJSON(w, map[string]any{"node": node, "message": "节点已更新，请点击重载使配置生效"})
 	case http.MethodDelete:
-		if err := s.nodeMgr.DeleteNode(r.Context(), nodeName); err != nil {
+		if err := nodeMgr.DeleteNode(r.Context(), nodeName); err != nil {
 			s.respondNodeError(w, err)
 			return
 		}
@@ -1343,11 +1571,12 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.ensureNodeManager(w) {
+	nodeMgr := s.nodeManager()
+	if !ensureNodeManager(w, nodeMgr) {
 		return
 	}
 
-	if err := s.nodeMgr.TriggerReload(r.Context()); err != nil {
+	if err := nodeMgr.TriggerReload(r.Context()); err != nil {
 		s.respondNodeError(w, err)
 		return
 	}
@@ -1356,8 +1585,8 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) ensureNodeManager(w http.ResponseWriter) bool {
-	if s.nodeMgr == nil {
+func ensureNodeManager(w http.ResponseWriter, nodeMgr NodeManager) bool {
+	if nodeMgr == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		writeJSON(w, map[string]any{"error": "节点管理未启用"})
 		return false
@@ -1380,48 +1609,47 @@ func (s *Server) respondNodeError(w http.ResponseWriter, err error) {
 // handleTraffic streams real-time traffic from sing-box Clash API as SSE.
 // Clash API /traffic returns newline-delimited JSON; we convert to SSE for browser EventSource.
 func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
-	// Connect to sing-box Clash API
-	resp, err := http.Get("http://127.0.0.1:9092/traffic")
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	_, ok := w.(http.Flusher)
+	if !ok {
+		writeStatusJSON(w, http.StatusInternalServerError, map[string]any{"error": "SSE not supported"})
+		return
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://127.0.0.1:9092/traffic", nil)
 	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		writeJSON(w, map[string]any{"error": "无法连接到流量统计接口", "details": err.Error()})
+		writeStatusJSON(w, http.StatusBadGateway, map[string]any{"error": "流量统计请求创建失败"})
+		return
+	}
+	resp, err := s.trafficClient.Do(request)
+	if err != nil {
+		if r.Context().Err() == nil {
+			writeStatusJSON(w, http.StatusBadGateway, map[string]any{"error": "流量统计接口未就绪", "details": err.Error()})
+		}
 		return
 	}
 	defer resp.Body.Close()
-
-	// Set SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		w.WriteHeader(http.StatusInternalServerError)
+	if resp.StatusCode != http.StatusOK {
+		writeStatusJSON(w, http.StatusBadGateway, map[string]any{"error": "流量统计接口未就绪", "upstream_status": resp.StatusCode})
 		return
 	}
-
-	// Read NDJSON lines from Clash API and forward as SSE
-	buf := make([]byte, 4096)
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		default:
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Connection", "keep-alive")
+	// Scanner preserves a complete JSON record across arbitrary network chunks.
+	// A bounded record size also prevents an invalid upstream from growing memory.
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 4096), 64*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !json.Valid([]byte(line)) {
+			continue
 		}
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			// Each chunk may contain one or more JSON lines; forward as-is in SSE data frames
-			lines := strings.Split(strings.TrimSpace(string(buf[:n])), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				fmt.Fprintf(w, "data: %s\n\n", line)
-			}
-			flusher.Flush()
-		}
-		if readErr != nil {
+		if err := writeSSE(w, []byte(line)); err != nil {
 			return
 		}
 	}
@@ -1429,6 +1657,11 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 
 // handleLogs returns recent console log content from the in-memory ring buffer.
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	content := SharedLogBuffer.Content()
 	writeJSON(w, map[string]any{"logs": content})
 }
@@ -1459,6 +1692,21 @@ func (s *Server) createSession() (*Session, error) {
 	}
 
 	s.sessionMu.Lock()
+	const maxLoginSessions = 1024
+	oldestToken := ""
+	var oldestTime time.Time
+	for token, existing := range s.sessions {
+		if !now.Before(existing.ExpiresAt) {
+			delete(s.sessions, token)
+			continue
+		}
+		if oldestToken == "" || existing.CreatedAt.Before(oldestTime) {
+			oldestToken, oldestTime = token, existing.CreatedAt
+		}
+	}
+	if len(s.sessions) >= maxLoginSessions {
+		delete(s.sessions, oldestToken)
+	}
 	s.sessions[token] = session
 	s.sessionMu.Unlock()
 
@@ -1476,7 +1724,7 @@ func (s *Server) validateSession(token string) bool {
 	}
 
 	// Check if expired
-	if time.Now().After(session.ExpiresAt) {
+	if !time.Now().Before(session.ExpiresAt) {
 		s.sessionMu.Lock()
 		delete(s.sessions, token)
 		s.sessionMu.Unlock()
@@ -1491,7 +1739,12 @@ func (s *Server) cleanupExpiredSessions() {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		now := time.Now()
 		s.sessionMu.Lock()
 		for token, session := range s.sessions {
@@ -1505,5 +1758,6 @@ func (s *Server) cleanupExpiredSessions() {
 
 // secureCompareStrings performs constant-time string comparison to prevent timing attacks.
 func secureCompareStrings(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+	aHash, bHash := sha256.Sum256([]byte(a)), sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(aHash[:], bHash[:]) == 1
 }

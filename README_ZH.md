@@ -17,14 +17,16 @@ Easy Proxies 是一个基于 sing-box 的代理池管理工具。
 - 自动健康检查、失败熔断和黑名单恢复；暂时性故障（超时/连接重置/503）与限流故障（HTTP 429）分别使用可配置的独立冷却时间。
 - 拨号失败自动重试：节点拨号失败时自动切换到另一个健康节点重试（可配置次数）。
 - 端口稳定（multi-port/hybrid）：每个节点按 URI 稳定标识（忽略名称与参数顺序），订阅刷新或重启后保持同一本地端口（持久化到 config.yaml 同目录的 `node_ports.json`）。
-- 粘性代理：可选的独立端口，按来源 IP 把客户端固定绑定到同一上游节点，保持出口 IP 稳定，与轮询的 pool 入口共存（仅 pool/hybrid 模式）。
+- 主端口会话路由：使用 `用户名.sessionID` 在多次连接间固定上游节点，节点失效时切换；普通用户名沿用原池调度。旧版按来源 IP 绑定的独立粘性端口继续兼容（仅 pool/hybrid 模式）。
 - Web 管理面板 + API：
-  - 节点状态/探测/导出
+  - 代理接入快捷卡片、节点搜索/状态筛选、探测/导出
+  - **会话路由页**：生成会话 ID、复制 HTTP/SOCKS5 URL 或 curl、查看绑定与重置会话；预览隐藏密码，复制的完整地址含真实认证信息
   - **手动拉黑/解封节点**
   - 动态设置（`external_ip`、`probe_target`、`skip_cert_verify`、`geoip`）
   - 节点配置增删改查 + 重载
   - 订阅状态查询 + 手动刷新 + **保存即时生效**
-  - **实时日志控制台**（最近 1000 行，WebSocket 流式传输）
+  - **实时日志控制台**（有界内存日志缓冲区，标签页隐藏时暂停轮询）
+- 面板支持移动端布局；节点当前状态以服务端可用性为准，历史失败次数不等于当前异常，操作失败会展示实际错误。
 - 新增可配置 DNS 解析器（对 VMess 域名节点非常关键）。
 - 可选 GeoIP 标记（支持 JP/KR/US/HK/TW/SG 地域分区，可在 WebUI 中开关，支持自动更新和热重载）。
 - **可配置日志轮转**，支持大小限制、备份数量和压缩。
@@ -35,26 +37,44 @@ Easy Proxies 是一个基于 sing-box 的代理池管理工具。
 
 ```bash
 cp config.example.yaml config.yaml
-cp nodes.example nodes.txt
+touch nodes.txt
 ```
 
-编辑 `config.yaml`，并配置节点来源（`nodes.txt` / `subscriptions` / `nodes`）。
+编辑 `config.yaml`，并配置节点来源（`nodes.txt` / `subscriptions` / `nodes`）。默认的 `vless://uuid@server:443` 只是格式示例，请先替换成真实节点；使用订阅或节点文件时，配置好实际来源后再删除该内联示例，避免产生 `lookup server: NXDOMAIN` 探测噪声。
 
 > 为什么要 `touch nodes.txt`？如果你用文件级挂载（如 `-v ./data/nodes.txt:/etc/easy_proxies/nodes.txt`）而宿主机上该文件不存在，Docker 会在宿主机上创建一个名为 `nodes.txt` 的**目录**并挂载进去，容器内就出现"本应是文件却是目录"的坑。预先创建文件（或直接挂载**目录** `./data:/etc/easy_proxies`，首启动会自动生成文件）可避免。若已踩坑：`rm -rf ./data/nodes.txt && touch ./data/nodes.txt` 后重启。
 
 ### 2）启动
 
-Docker：
+Docker 默认挂载 **`./data`** 目录，实际读取的是 `data/config.yaml`，不是仓库根目录的 `config.yaml`。已准备好配置时，先复制到 `data/config.yaml` 再启动；首次启动也可自动生成配置文件，随后编辑该文件、配置真实节点后再使用代理。
 
 ```bash
 docker compose up -d
 ```
 
-本地运行：
+本地运行（需 **Go 1.26.9 或更新版本**，Docker builder 固定为 Go 1.26.9）：
 
 ```bash
 go run ./cmd/easy_proxies -config config.yaml
 ```
+
+普通源码构建不包含可选的 sing-box 功能，包括 Clash API 流量统计；管理面板仍可使用，但实时流量图需要 `with_clash_api`。需要与 Docker 镜像相同的功能标签时使用：
+
+```bash
+go run -tags "with_utls with_quic with_grpc with_wireguard with_gvisor with_clash_api" \
+  ./cmd/easy_proxies -config config.yaml
+```
+
+## 升级到 v3.2.0
+
+详见 [中英双语发布说明](docs/releases/v3.2.0.md) 和 [完整更新日志](CHANGELOG.md)。升级前备份挂载的配置目录，并保留 `node_ports.json`。固定版本部署时，将 Compose 镜像设为 `ghcr.io/jasonwong1991/easy_proxies:3.2.0`；该版本镜像发布工作流完成后执行：
+
+```bash
+docker compose pull easy_proxies
+docker compose up -d --force-recreate easy_proxies
+```
+
+重建容器会清空内存中的命名会话，已保存的节点端口仍保留。修改管理密码立即生效，需要重新登录。推荐目录挂载以获得配置原子替换；单文件 bind mount 继续使用锁内原地写兼容路径，但不具备相同的断电/崩溃原子性保障。源码构建需 Go 1.26.9+；可选协议/流量统计还需完整生产标签。
 
 ## 最小配置示例（Pool）
 
@@ -158,15 +178,52 @@ curl --proxy http://user:pass@localhost:1221 https://www.google.com
 把代理地址中的路径发送给代理服务，因此 `http://localhost:1221/jp/`
 不能可靠地选择地区，应改用代理专用请求头功能。
 
-## 粘性代理（可选，仅 Pool/Hybrid 模式）
+## 主端口会话路由（仅 Pool/Hybrid 模式）
 
-开启后会额外监听一个独立端口（默认 `listener.port + 1`，即 `2324`），与原 `2323` 端口共存。通过粘性端口接入的客户端会按**来源 IP** 固定绑定到同一个上游节点，保持出口 IP 稳定（避免轮询导致 IP 频繁跳变触发风控/掉登录态）。绑定为永久保持，仅当该节点被拉黑/移除时才重新选择。监听地址与认证复用 `listener` 配置。
+同一个 HTTP/SOCKS5 主入口（默认 `2323`）同时支持普通调度和固定会话，不需要额外端口。先为 listener 配置非空用户名，认证使用其原有密码；建议设置非空强密码：
 
 ```yaml
+listener:
+  address: 0.0.0.0
+  port: 2323
+  username: wang
+  password: "1234"  # 示例密码，请自行修改
+
 sticky:
-  enabled: true
-  port: 2324    # 留空或 0 则默认为 listener.port + 1
+  session_enabled: true # 省略时默认开启
+  session_ttl: 24h      # 绑定空闲超过此时间后释放
+  max_sessions: 10000   # 会话容量上限，限制内存占用
+  enabled: false       # 旧来源 IP 粘性端口，与 session_enabled 相互独立
+  port: 2324
 ```
+
+| 代理地址 | 行为 |
+| --- | --- |
+| `http://wang:1234@127.0.0.1:2323` | 普通池调度，沿用已有调度模式 |
+| `http://wang.account01:1234@127.0.0.1:2323` | 会话 `account01` 固定同一上游节点 |
+| `socks5h://wang.account01:1234@127.0.0.1:2323` | SOCKS5 使用同一会话，由代理解析目标域名 |
+
+会话 ID 由客户端自定义，无需提前注册，支持 **1–64 个 `[A-Za-z0-9_-]` 字符**。同一 ID 复用同一绑定，换一个 ID 就建立独立绑定，但不同 ID 不保证分配不同节点。密码仍是 listener 密码；后缀不是新账号或认证密码。
+
+```bash
+# 多次新建连接使用同一会话。
+curl --proxy 'http://wang.account01:1234@127.0.0.1:2323' https://example.com
+
+# HTTP 与 SOCKS5 可共用相同会话。
+curl --proxy 'socks5h://wang.account01:1234@127.0.0.1:2323' https://example.com
+```
+
+- 绑定节点不可用、进入冷却/黑名单、被移除或拨号失败时，按池可用性与重试策略切换，并保留新绑定。
+- 固定的是**上游节点**，不保证节点提供方的公网出口 IP 永久不变。已经建立的连接不迁移，已发送请求不会因 HTTP 业务错误自动重放。
+- 固定绑定针对 TCP（HTTP、CONNECT、SOCKS5 CONNECT）。SOCKS5 UDP 可优先复用支持 UDP 的绑定节点；需要回退时只影响该请求，不改 TCP 绑定，不保证 UDP 固定出口。
+- 订阅刷新与核心重载时，仍存在的同一 URI 稳定身份可保留绑定；空闲超过 TTL 或触及容量清理时可释放绑定。空闲时间按新连接拨号活动计算，长连接中的持续流量不续期。**进程重启会清空会话**。
+- 该功能要求 `pool`/`hybrid` 模式且 listener 已配置非空用户名。设置 `session_enabled: false` 可恢复仅接受完整普通用户名的认证方式。
+
+### 旧来源 IP 粘性端口兼容
+
+`sticky.enabled: true` 仍额外监听旧版粘性端口（默认 `listener.port + 1`，通常为 `2324`），监听地址与认证复用 listener。使用 `http://wang:1234@127.0.0.1:2324` 时，仍按**来源 IP** 固定上游节点，不使用用户名后缀识别会话；同一 NAT 出口的客户端会共享这类绑定。它与主端口会话功能相互独立，`session_ttl` 和 `max_sessions` 不改变旧 IP 绑定的生命周期。
+
+完整的生命周期、兼容性和排错说明见 [会话路由指南](docs/session-routing.md)。
 
 ## DNS 配置说明
 
@@ -212,6 +269,7 @@ dns:
   - 节点顺序：内联节点在前，订阅节点在后
   - 各节点的来源标识（inline/subscription）会在管理界面中显示
 - **端口稳定**（multi-port/hybrid）：节点按 URI 稳定标识（忽略名称与参数顺序），订阅改名或重排都保持同一本地端口；分配结果保存到 config.yaml 同目录的 `node_ports.json`，重启后自动恢复。删除该文件可强制重新分配。
+  - VMess base64 JSON 链接还忽略名称字段 `ps`、顶层 JSON 字段顺序和支持的 base64 编码形式差异。旧版端口映射 key 会在载入时自动归一化并复用既有端口，升级身份格式时不需要删除 `node_ports.json`。
 
 ## 协议支持注意事项
 
@@ -233,25 +291,34 @@ dns:
 
 ## 管理 API（核心）
 
-- `POST /api/auth`
+- `GET|POST|DELETE /api/auth`（查询登录状态 / 登录 / 退出）
 - `GET|PUT /api/settings`
 - `GET /api/nodes`
 - `POST /api/nodes/{tag}/probe`
 - `POST /api/nodes/{tag}/release`
 - `POST /api/nodes/{tag}/blacklist`
 - `POST /api/nodes/probe-all`（SSE）
-- `GET /api/export`
+- `GET /api/export`（默认导出健康节点，`all=true` 导出全部；`scheme=http/socks5/all`）
 - `GET|PUT /api/subscription/config`
 - `GET|POST /api/subscription/status|refresh`
 - `GET|POST|PUT|DELETE /api/nodes/config[...]`
+- `GET|DELETE /api/proxy-sessions`（命名会话绑定列表 / 重置全部绑定）
+- `DELETE /api/proxy-sessions/{id}`（重置单个绑定；id 为完整用户名，例如 `wang.account01`）
+- `POST /api/proxy-sessions/links`（传入 `session_id`、`scheme` 生成 HTTP/SOCKS5 地址，不连接、不预先绑定）
 - `POST /api/reload`
 
 `management.password` 为空时，Web/API 不要求登录。
+
+`GET /api/auth` 查询登录状态，`POST /api/auth` 登录，`DELETE /api/auth` 退出。修改管理密码立即生效并撤销已有登录会话，请重新登录后再应用其他待处理设置。节点配置和诊断页支持搜索及每批 300 条按需展开；隐藏标签页时暂停实时流和日志轮询，批量探测忙碌或请求失败会显示具体错误。
+
+导出的本地代理 URL 含真实认证信息。节点导出和会话链接生成均会替换通配监听地址，并正确编码特殊字符凭据和 IPv6 主机；客户端实际访问地址与管理地址不同时，设置 `external_ip`。固定会话地址请在会话路由页生成，节点导出不是会话注册。
 
 ## 重要运行说明
 
 - 重载（`/api/reload` 或订阅刷新）会中断现有连接。
 - Settings API 会把配置写回 `config.yaml`；部分设置需要重载后才能完全生效。
+- 管理密码无需重载；修改后需要重新登录。关闭订阅定时刷新不影响手动刷新；任一订阅源失败或返回空内容时保留原有订阅集合并提示错误。
+- 建议挂载配置目录，常规保存使用原子替换并保留文件权限；单文件挂载使用锁内原地写兼容路径，不具备相同的断电/进程崩溃原子性保障。
 - 省略项默认值可在 `internal/config/config.go` 中查看。
 - 日志轮转通过 `log` 配置段设置；当 `output: file` 时，日志同时写入控制台和文件，并自动轮转。
 
@@ -367,9 +434,21 @@ docker run --user $(id -u):$(id -g) \
 
 ## 开发验证
 
+使用 **Go 1.26.9 或更新版本**（以 `go.mod` 为准），fixture 测试使用 Node.js 24；Docker builder 固定为 Go 1.26.9。发布工作流要求以下检查通过后才构建/发布镜像，实际运行结果以 GitHub Actions 为准：
+
 ```bash
-go test ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+FEATURE_TAGS='with_utls with_quic with_grpc with_wireguard with_gvisor with_clash_api'
+go test -count=1 -tags "$FEATURE_TAGS" ./...
+sh -n entrypoint.sh
+node --test scripts/test-ui.mjs scripts/test-entrypoint.mjs
 ```
+
+运行时修改应使用临时目录、合成节点和本机回环服务补回归测试，避免操作真实订阅。`scripts/test-ui-browser.mjs` 提供可选浏览器验证（需 Playwright 和 Chrome）。
+
+详见 [全面审查报告与迭代路线图](docs/project-review-2026-10-11.md)，包含本轮已解决问题、性能实测、升级注意事项及待办。
 
 ## Star History
 

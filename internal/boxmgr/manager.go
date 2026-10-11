@@ -14,8 +14,10 @@ import (
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/inbound/session"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/routing"
 
 	"github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
@@ -53,30 +55,46 @@ func WithLogger(l Logger) Option {
 	return func(m *Manager) { m.logger = l }
 }
 
+// managedBox isolates lifecycle coordination from the concrete sing-box core.
+// The private factory is injectable by local regression tests.
+type managedBox interface {
+	Start() error
+	Close() error
+}
+
 // Manager owns the lifecycle of the active sing-box instance.
 type Manager struct {
-	mu sync.RWMutex
+	// Lifecycle operations never hold mu while waiting on network shutdown.
+	lifecycleMu sync.Mutex
+	mu          sync.RWMutex
 
-	currentBox    *box.Box
+	currentBox    managedBox
+	boxFactory    func(context.Context, *config.Config) (managedBox, error)
 	monitorMgr    *monitor.Manager
 	monitorServer *monitor.Server
 	geoRouter     *geoip.Router
 	cfg           *config.Config
 	monitorCfg    monitor.Config
+	// The store belongs to the manager, not an individual box, so subscription
+	// refreshes and core reloads do not discard authenticated session bindings.
+	routingStore *routing.Store
 
 	drainTimeout      time.Duration
 	minAvailableNodes int
 	logger            Logger
 
 	baseCtx            context.Context
+	baseCancel         context.CancelFunc
+	closed             bool
 	healthCheckStarted bool
 }
 
 // New creates a BoxManager with the given config.
 func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager {
 	m := &Manager{
-		cfg:        cfg,
-		monitorCfg: monitorCfg,
+		cfg:          cfg,
+		monitorCfg:   monitorCfg,
+		routingStore: routing.NewStore(config.DefaultMaxSessions, config.DefaultSessionTTL),
 	}
 	m.applyConfigSettings(cfg)
 	for _, opt := range opts {
@@ -92,15 +110,20 @@ func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager
 }
 
 // Start creates and starts the initial sing-box instance.
-func (m *Manager) Start(ctx context.Context) error {
+func (m *Manager) Start(ctx context.Context) (err error) {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := m.ensureMonitor(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return errors.New("box manager closed")
+	}
 	if m.cfg == nil {
 		m.mu.Unlock()
 		return errors.New("box manager requires config")
@@ -110,81 +133,120 @@ func (m *Manager) Start(ctx context.Context) error {
 		return errors.New("sing-box already running")
 	}
 	m.applyConfigSettings(m.cfg)
+	ctx, m.baseCancel = context.WithCancel(ctx)
 	m.baseCtx = ctx
 	cfg := m.cfg
 	m.mu.Unlock()
+	// A failed startup may already own a management listener and health-check
+	// worker. Release them as well as the partially initialized box.
+	defer func() {
+		if err != nil {
+			m.closeComponents()
+		}
+	}()
+	if err = m.ensureMonitor(ctx); err != nil {
+		return err
+	}
 
-	// Try to start, with automatic port conflict resolution
-	var instance *box.Box
-	maxRetries := 10
+	var instance managedBox
+	var lastStartErr error
+	started := false
+	const maxRetries = 10
 	for retry := 0; retry < maxRetries; retry++ {
-		var err error
-		instance, err = m.createBox(ctx, cfg)
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		instance, err = m.createInstance(ctx, cfg)
 		if err != nil {
 			return err
 		}
 		if err = instance.Start(); err != nil {
 			_ = instance.Close()
-			// Check if it's a port conflict error
+			lastStartErr = err
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
-				if reassigned := reassignConflictingPort(cfg, conflictPort); reassigned {
-					pool.ResetSharedStateStore() // Reset shared state for rebuild
+				m.mu.Lock()
+				reassigned := reassignConflictingPort(cfg, conflictPort)
+				m.mu.Unlock()
+				if reassigned {
+					pool.ResetSharedStateStore()
+					m.monitorMgr.ClearNodes()
 					continue
 				}
 			}
 			return fmt.Errorf("start sing-box: %w", err)
 		}
-		break // Success
+		started = true
+		break
 	}
-
+	if !started {
+		return fmt.Errorf("start sing-box: exhausted %d attempts: %w", maxRetries, lastStartErr)
+	}
+	if err = ctx.Err(); err != nil {
+		_ = instance.Close()
+		return err
+	}
 	m.mu.Lock()
 	m.currentBox = instance
-	m.mu.Unlock()
-
-	// Start periodic health check after nodes are registered
-	m.mu.Lock()
-	if m.monitorMgr != nil && !m.healthCheckStarted {
-		m.monitorMgr.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
+	manager := m.monitorMgr
+	startHealthCheck := manager != nil && !m.healthCheckStarted
+	if startHealthCheck {
 		m.healthCheckStarted = true
 	}
 	m.mu.Unlock()
-
-	// Wait for initial health check if min nodes configured
+	if startHealthCheck {
+		manager.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
+	}
 	if cfg.SubscriptionRefresh.MinAvailableNodes > 0 {
 		timeout := cfg.SubscriptionRefresh.HealthCheckTimeout
 		if timeout <= 0 {
 			timeout = defaultHealthCheckTimeout
 		}
-		if err := m.waitForHealthCheck(timeout); err != nil {
-			m.logger.Warnf("initial health check warning: %v", err)
-			// Don't fail startup, just warn
+		if healthErr := m.waitForHealthCheck(ctx, timeout); healthErr != nil {
+			if err = ctx.Err(); err != nil {
+				return err
+			}
+			m.logger.Warnf("initial health check warning: %v", healthErr)
 		}
 	}
-
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	m.logger.Infof("sing-box instance started with %d nodes", len(cfg.Nodes))
-
-	// Start GeoIP router if enabled
 	if cfg.GeoIP.Enabled {
 		m.startGeoIPRouter(ctx, cfg)
 	}
-
-	return nil
+	return ctx.Err()
 }
 
 // Reload gracefully switches to a new configuration.
 // For multi-port mode, we must stop the old instance first to release ports.
 func (m *Manager) Reload(newCfg *config.Config) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	return m.reloadLocked(newCfg)
+}
+
+// reloadLocked requires lifecycleMu and never holds mu during network I/O.
+func (m *Manager) reloadLocked(newCfg *config.Config) error {
 	if newCfg == nil {
 		return errors.New("new config is nil")
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return errors.New("box manager closed")
+	}
 	if m.currentBox == nil {
 		m.mu.Unlock()
 		return errors.New("manager not started")
 	}
 	ctx := m.baseCtx
+	if ctx != nil && ctx.Err() != nil {
+		m.mu.Unlock()
+		return ctx.Err()
+	}
 	oldBox := m.currentBox
 	oldCfg := m.cfg
 	m.currentBox = nil // Mark as reloading
@@ -207,14 +269,17 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	// Stop GeoIP router before starting new box to release its port
 	m.mu.Lock()
-	if m.geoRouter != nil {
-		m.geoRouter.Stop()
-		m.geoRouter = nil
-	}
+	oldRouter := m.geoRouter
+	m.geoRouter = nil
 	m.mu.Unlock()
+	if oldRouter != nil {
+		_ = oldRouter.Stop()
+	}
 
 	// Give OS time to release ports
-	time.Sleep(500 * time.Millisecond)
+	if err := waitForContext(ctx, 500*time.Millisecond); err != nil {
+		return err
+	}
 
 	// Reset shared state store to ensure clean state for new config
 	pool.ResetSharedStateStore()
@@ -235,13 +300,16 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	// last-resort escape hatch (only once we've waited through several attempts):
 	// moving a port silently breaks clients pointed at the old one and is exactly
 	// the failure this guards against.
-	var instance *box.Box
+	var instance managedBox
 	started := false
 	var lastStartErr error
 	maxRetries := 10
 	for retry := 0; retry < maxRetries; retry++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var err error
-		instance, err = m.createBox(ctx, newCfg)
+		instance, err = m.createInstance(ctx, newCfg)
 		if err != nil {
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("create new box: %w", err)
@@ -263,7 +331,9 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		// Give the OS more time to release the just-closed listener, then retry
 		// the same port assignment.
 		m.logger.Warnf("port %d still in use on start attempt %d/%d, waiting for release and retrying...", conflictPort, retry+1, maxRetries)
-		time.Sleep(300 * time.Millisecond)
+		if err := waitForContext(ctx, 300*time.Millisecond); err != nil {
+			return err
+		}
 
 		// Only after we've waited through the first half of our attempts do we
 		// treat the conflict as persistent (some other process owns the port)
@@ -286,9 +356,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		return fmt.Errorf("start new box: exhausted %d attempts: %w", maxRetries, lastStartErr)
 	}
 
-	m.applyConfigSettings(newCfg)
-
+	if err := ctx.Err(); err != nil {
+		_ = instance.Close()
+		return err
+	}
 	m.mu.Lock()
+	m.applyConfigSettings(newCfg)
 	m.currentBox = instance
 	m.cfg = newCfg
 	m.mu.Unlock()
@@ -310,11 +383,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		m.startGeoIPRouter(ctx, newCfg)
 	} else {
 		m.mu.Lock()
-		if m.geoRouter != nil {
-			m.geoRouter.Stop()
-			m.geoRouter = nil
-		}
+		oldRouter := m.geoRouter
+		m.geoRouter = nil
 		m.mu.Unlock()
+		if oldRouter != nil {
+			_ = oldRouter.Stop()
+		}
 	}
 
 	return nil
@@ -322,19 +396,26 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 // rollbackToOldConfig attempts to restart with the previous configuration.
 func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config) {
-	if oldCfg == nil {
+	if oldCfg == nil || ctx.Err() != nil {
 		return
 	}
 	m.logger.Warnf("attempting rollback to previous config...")
+	pool.ResetSharedStateStore()
+	if m.monitorMgr != nil {
+		m.monitorMgr.ClearNodes()
+	}
 
 	// The rollback binds the same ports the failed start attempted, which may
 	// still be draining. Retry with backoff so a transient bind conflict does
 	// not leave the manager with no running box at all.
-	var instance *box.Box
+	var instance managedBox
 	const rollbackAttempts = 5
 	for attempt := 0; attempt < rollbackAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
 		var err error
-		instance, err = m.createBox(ctx, oldCfg)
+		instance, err = m.createInstance(ctx, oldCfg)
 		if err != nil {
 			m.logger.Errorf("rollback failed to create box: %v", err)
 			return
@@ -345,7 +426,13 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		_ = instance.Close()
 		instance = nil
 		m.logger.Warnf("rollback start attempt %d/%d failed: %v", attempt+1, rollbackAttempts, err)
-		time.Sleep(300 * time.Millisecond)
+		if waitForContext(ctx, 300*time.Millisecond) != nil {
+			return
+		}
+	}
+	if instance != nil && ctx.Err() != nil {
+		_ = instance.Close()
+		return
 	}
 	if instance == nil {
 		m.logger.Errorf("rollback failed to start box after %d attempts", rollbackAttempts)
@@ -359,34 +446,75 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 	if m.monitorServer != nil {
 		m.monitorServer.SetConfig(m.cfg)
 	}
+	if oldCfg.GeoIP.Enabled {
+		m.startGeoIPRouter(ctx, oldCfg)
+	}
+	if m.monitorMgr != nil {
+		go m.monitorMgr.ProbeAllNow(periodicHealthTimeout)
+	}
 	m.logger.Infof("rollback successful")
 }
 
 // Close terminates the active instance and auxiliary components.
 func (m *Manager) Close() error {
+	// Cancel before waiting for the lifecycle lock: a reload/startup waiting
+	// for ports or health checks must not delay shutdown or revive the service.
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.closed = true
+	cancel := m.baseCancel
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	return m.closeComponents()
+}
 
-	var err error
-	if m.currentBox != nil {
-		err = m.currentBox.Close()
-		m.currentBox = nil
-	}
-	if m.monitorServer != nil {
-		m.monitorServer.Shutdown(context.Background())
-		m.monitorServer = nil
-	}
-	if m.monitorMgr != nil {
-		m.monitorMgr.Stop()
-		m.monitorMgr = nil
-		m.healthCheckStarted = false
-	}
-	if m.geoRouter != nil {
-		m.geoRouter.Stop()
-		m.geoRouter = nil
-	}
+// closeComponents runs with lifecycleMu held, but not mu during shutdown.
+func (m *Manager) closeComponents() error {
+	m.mu.Lock()
+	instance, server, manager, router := m.currentBox, m.monitorServer, m.monitorMgr, m.geoRouter
+	m.currentBox, m.monitorServer, m.monitorMgr, m.geoRouter = nil, nil, nil, nil
+	m.healthCheckStarted = false
 	m.baseCtx = nil
+	cancel := m.baseCancel
+	m.baseCancel = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	// Do not hold the manager lock while HTTP shutdown waits for handlers:
+	// active settings/node requests may themselves be waiting for that lock.
+	var err error
+	if manager != nil {
+		manager.Stop()
+	}
+	if instance != nil {
+		err = instance.Close()
+	}
+	if server != nil {
+		server.Shutdown(context.Background())
+	}
+	if router != nil {
+		router.Stop()
+	}
+	if m.routingStore != nil {
+		m.routingStore.Clear()
+	}
 	return err
+}
+
+// LockSettings synchronizes management writes with node CRUD and configuration
+// snapshots. The management server always takes this lock before its own
+// config lock, matching the manager -> monitor lock order used on reload.
+func (m *Manager) LockSettings() func() {
+	m.lifecycleMu.Lock()
+	m.mu.Lock()
+	return func() {
+		m.mu.Unlock()
+		m.lifecycleMu.Unlock()
+	}
 }
 
 // MonitorManager returns the shared monitor manager.
@@ -407,11 +535,12 @@ func (m *Manager) MonitorServer() *monitor.Server {
 func (m *Manager) startGeoIPRouter(ctx context.Context, cfg *config.Config) {
 	// Stop existing router if any
 	m.mu.Lock()
-	if m.geoRouter != nil {
-		m.geoRouter.Stop()
-		m.geoRouter = nil
-	}
+	oldRouter := m.geoRouter
+	m.geoRouter = nil
 	m.mu.Unlock()
+	if oldRouter != nil {
+		_ = oldRouter.Stop()
+	}
 
 	geoipPort := cfg.GeoIP.Port
 	if geoipPort == 0 {
@@ -499,6 +628,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		inboundRegistry := include.InboundRegistry()
+		session.Register(inboundRegistry)
 		outboundRegistry := include.OutboundRegistry()
 		pool.Register(outboundRegistry)
 		endpointRegistry := include.EndpointRegistry()
@@ -507,6 +637,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 
 		boxCtx := box.Context(ctx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
 		boxCtx = monitor.ContextWith(boxCtx, m.monitorMgr)
+		boxCtx = routing.WithStore(boxCtx, m.routingStore)
 
 		instance, err := newBoxRecover(box.Options{Context: boxCtx, Options: opts})
 		if err == nil {
@@ -541,7 +672,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 				if poolOpts, ok := ob.Options.(*pool.Options); ok {
 					poolOpts.Members = removeFromSlice(poolOpts.Members, badTag)
 					delete(poolOpts.Metadata, badTag)
-					
+
 					// If the pool is now empty, remove it to avoid another validation error
 					if len(poolOpts.Members) == 0 {
 						log.Printf("⚠️  Removing empty pool '%s'", ob.Tag)
@@ -604,7 +735,7 @@ func (m *Manager) gracefulSwitch(newBox *box.Box) error {
 }
 
 // drainOldBox waits for drain timeout then closes the old box.
-func (m *Manager) drainOldBox(oldBox *box.Box, timeout time.Duration) {
+func (m *Manager) drainOldBox(oldBox managedBox, timeout time.Duration) {
 	if oldBox == nil {
 		return
 	}
@@ -630,8 +761,11 @@ func removeFromSlice(slice []string, element string) []string {
 }
 
 // waitForHealthCheck polls until enough nodes are available or timeout.
-func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
-	if m.monitorMgr == nil || m.minAvailableNodes <= 0 {
+func (m *Manager) waitForHealthCheck(ctx context.Context, timeout time.Duration) error {
+	m.mu.RLock()
+	manager, minimum := m.monitorMgr, m.minAvailableNodes
+	m.mu.RUnlock()
+	if manager == nil || minimum <= 0 {
 		return nil
 	}
 	if timeout <= 0 {
@@ -644,23 +778,30 @@ func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
 
 	for {
 		available, total := m.availableNodeCount()
-		if available >= m.minAvailableNodes {
+		if available >= minimum {
 			m.logger.Infof("health check passed: %d/%d nodes available", available, total)
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout: %d/%d nodes available (need >= %d)", available, total, m.minAvailableNodes)
+			return fmt.Errorf("timeout: %d/%d nodes available (need >= %d)", available, total, minimum)
 		}
-		<-ticker.C
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
 // availableNodeCount returns (available, total) node counts.
 func (m *Manager) availableNodeCount() (int, int) {
-	if m.monitorMgr == nil {
+	m.mu.RLock()
+	manager := m.monitorMgr
+	m.mu.RUnlock()
+	if manager == nil {
 		return 0, 0
 	}
-	snapshots := m.monitorMgr.Snapshot()
+	snapshots := manager.Snapshot()
 	total := len(snapshots)
 	available := 0
 	for _, snap := range snapshots {
@@ -700,6 +841,7 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		// Set NodeManager for config CRUD endpoints
 		if m.monitorServer != nil {
 			m.monitorServer.SetNodeManager(m)
+			m.monitorServer.SetRoutingStore(m.routingStore)
 		}
 		// Note: StartPeriodicHealthCheck is called after nodes are registered in Start()
 	}
@@ -715,6 +857,9 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 func (m *Manager) applyConfigSettings(cfg *config.Config) {
 	if cfg == nil {
 		return
+	}
+	if m.routingStore != nil {
+		m.routingStore.Configure(cfg.Sticky.MaxSessionsOrDefault(), cfg.Sticky.SessionTTLOrDefault())
 	}
 	if cfg.SubscriptionRefresh.DrainTimeout > 0 {
 		m.drainTimeout = cfg.SubscriptionRefresh.DrainTimeout
@@ -780,6 +925,8 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		}
 	}
 
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -816,6 +963,8 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 	}
 
 	name = strings.TrimSpace(name)
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -854,6 +1003,8 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 	}
 
 	name = strings.TrimSpace(name)
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -883,19 +1034,30 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 		}
 	}
 
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	m.mu.RLock()
 	cfgCopy := m.copyConfigLocked()
-	portMap := m.cfg.BuildPortMap() // Preserve existing port assignments
+	var portMap map[string]uint16
+	if m.cfg != nil {
+		portMap = m.cfg.BuildPortMap()
+	}
 	m.mu.RUnlock()
 
 	if cfgCopy == nil {
 		return errConfigUnavailable
 	}
-	return m.ReloadWithPortMap(cfgCopy, portMap)
+	return m.reloadWithPortMapLocked(cfgCopy, portMap)
 }
 
 // ReloadWithPortMap gracefully switches to a new configuration, preserving port assignments.
 func (m *Manager) ReloadWithPortMap(newCfg *config.Config, portMap map[string]uint16) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	return m.reloadWithPortMapLocked(newCfg, portMap)
+}
+
+func (m *Manager) reloadWithPortMapLocked(newCfg *config.Config, portMap map[string]uint16) error {
 	if newCfg == nil {
 		return errors.New("new config is nil")
 	}
@@ -908,7 +1070,7 @@ func (m *Manager) ReloadWithPortMap(newCfg *config.Config, portMap map[string]ui
 		return fmt.Errorf("normalize config with port map: %w", err)
 	}
 
-	if err := m.Reload(newCfg); err != nil {
+	if err := m.reloadLocked(newCfg); err != nil {
 		return err
 	}
 
@@ -919,6 +1081,82 @@ func (m *Manager) ReloadWithPortMap(newCfg *config.Config, portMap map[string]ui
 		m.logger.Warnf("failed to persist node ports: %v", err)
 	}
 	return nil
+}
+
+// ReloadWithCurrentConfig applies a transformation to the latest configuration
+// as one lifecycle transaction. Management writes and node CRUD cannot be lost
+// between the snapshot and the reload. Callbacks must not call manager methods.
+// persist owns its disk transaction; failure restores the previous runtime.
+func (m *Manager) ReloadWithCurrentConfig(update func(*config.Config) error, persist func(*config.Config) error) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.mu.RLock()
+	oldCfg := m.copyConfigLocked()
+	closed, running := m.closed, m.currentBox != nil
+	m.mu.RUnlock()
+	if closed {
+		return errors.New("box manager closed")
+	}
+	if oldCfg == nil {
+		return errConfigUnavailable
+	}
+	if !running {
+		return errors.New("manager not started")
+	}
+	// A second independent snapshot keeps the rollback configuration pristine.
+	m.mu.RLock()
+	candidate := m.copyConfigLocked()
+	m.mu.RUnlock()
+	if update != nil {
+		if err := update(candidate); err != nil {
+			return err
+		}
+	}
+	if err := candidate.NormalizeWithPortMap(oldCfg.BuildPortMap()); err != nil {
+		return fmt.Errorf("normalize updated config: %w", err)
+	}
+	if err := m.reloadLocked(candidate); err != nil {
+		return err
+	}
+	if persist != nil {
+		if err := persist(candidate); err != nil {
+			if rollbackErr := m.reloadLocked(oldCfg); rollbackErr != nil {
+				return fmt.Errorf("persist updated config: %w; runtime rollback failed: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("persist updated config: %w; runtime rolled back", err)
+		}
+	}
+	if err := candidate.SaveNodePortMap(); err != nil {
+		m.logger.Warnf("failed to persist node ports: %v", err)
+	}
+	return nil
+}
+
+// CurrentConfig returns an independent snapshot of the latest configuration.
+// Background refreshes must base their updates on this snapshot, not the
+// startup pointer which becomes stale after a management reload.
+func (m *Manager) CurrentConfig() *config.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.copyConfigLocked()
+}
+
+// CurrentSubscriptionConfig returns only worker-owned settings and file paths.
+// Status polling and timer reconciliation must not clone thousands of nodes.
+// Like CurrentConfig, this uses only mu, never the lifecycle lock.
+func (m *Manager) CurrentSubscriptionConfig() *config.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cfg == nil {
+		return nil
+	}
+	snapshot := &config.Config{
+		NodesFile:           m.cfg.NodesFile,
+		Subscriptions:       append([]string(nil), m.cfg.Subscriptions...),
+		SubscriptionRefresh: m.cfg.SubscriptionRefresh,
+	}
+	snapshot.SetFilePath(m.cfg.FilePath())
+	return snapshot
 }
 
 // CurrentPortMap returns the current port mapping from the active configuration.
@@ -934,7 +1172,7 @@ func (m *Manager) CurrentPortMap() map[string]uint16 {
 // --- Helper functions ---
 
 // portBindErrorRegex matches "listen tcp4 0.0.0.0:24282: bind: address already in use"
-var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
+var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? (?:\[[^\]]*\]|[^:]+):(\d+): bind: address already in use`)
 
 // extractPortFromBindError extracts the port number from a bind error message.
 func extractPortFromBindError(err error) uint16 {
@@ -953,13 +1191,32 @@ func extractPortFromBindError(err error) uint16 {
 	return 0
 }
 
-
 // reassignConflictingPort finds the node using the conflicting port and assigns a new port.
 func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 	// Build set of used ports
 	usedPorts := make(map[uint16]bool)
 	if cfg.Mode == "hybrid" {
 		usedPorts[cfg.Listener.Port] = true
+	}
+	if cfg.Sticky.Enabled {
+		port := cfg.Sticky.Port
+		if port == 0 && cfg.Listener.Port < 65535 {
+			port = cfg.Listener.Port + 1
+		}
+		usedPorts[port] = true
+	}
+	if cfg.GeoIP.Enabled {
+		port := cfg.GeoIP.Port
+		if port == 0 {
+			port = 1221
+		}
+		if port == cfg.Listener.Port {
+			port = 1221
+			if port == cfg.Listener.Port {
+				port = cfg.Listener.Port + 1
+			}
+		}
+		usedPorts[port] = true
 	}
 	for _, node := range cfg.Nodes {
 		usedPorts[node.Port] = true
@@ -969,20 +1226,20 @@ func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 	for idx := range cfg.Nodes {
 		if cfg.Nodes[idx].Port == conflictPort {
 			// Find next available port
-			newPort := conflictPort + 1
+			newPort := int(conflictPort) + 1
 			address := cfg.MultiPort.Address
 			if address == "" {
 				address = "0.0.0.0"
 			}
-			for usedPorts[newPort] || !config.IsPortAvailable(address, newPort) {
+			for newPort <= 65535 && (usedPorts[uint16(newPort)] || !config.IsPortAvailable(address, uint16(newPort))) {
 				newPort++
-				if newPort > 65535 {
-					log.Printf("❌ No available port found for node %q", cfg.Nodes[idx].Name)
-					return false
-				}
+			}
+			if newPort > 65535 {
+				log.Printf("❌ No available port found for node %q", cfg.Nodes[idx].Name)
+				return false
 			}
 			log.Printf("⚠️  Port %d in use, reassigning node %q to port %d", conflictPort, cfg.Nodes[idx].Name, newPort)
-			cfg.Nodes[idx].Port = newPort
+			cfg.Nodes[idx].Port = uint16(newPort)
 			return true
 		}
 	}
@@ -1004,6 +1261,18 @@ func (m *Manager) copyConfigLocked() *config.Config {
 	}
 	cloned := *m.cfg
 	cloned.Nodes = cloneNodes(m.cfg.Nodes)
+	if m.cfg.Management.Enabled != nil {
+		value := *m.cfg.Management.Enabled
+		cloned.Management.Enabled = &value
+	}
+	if m.cfg.Pool.RetryEnabled != nil {
+		value := *m.cfg.Pool.RetryEnabled
+		cloned.Pool.RetryEnabled = &value
+	}
+	if m.cfg.Sticky.SessionEnabled != nil {
+		value := *m.cfg.Sticky.SessionEnabled
+		cloned.Sticky.SessionEnabled = &value
+	}
 	// Clone Subscriptions slice to avoid shared backing array issues
 	if len(m.cfg.Subscriptions) > 0 {
 		cloned.Subscriptions = make([]string, len(m.cfg.Subscriptions))
@@ -1103,4 +1372,23 @@ func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) 
 	}
 
 	return node, nil
+}
+
+// waitForContext bounds retry backoff by the runtime lifetime.
+func waitForContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *Manager) createInstance(ctx context.Context, cfg *config.Config) (managedBox, error) {
+	if m.boxFactory != nil {
+		return m.boxFactory(ctx, cfg)
+	}
+	return m.createBox(ctx, cfg)
 }

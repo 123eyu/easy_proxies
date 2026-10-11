@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -16,6 +17,12 @@ import (
 
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("application requires config")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Build monitor config
 	proxyUsername := cfg.Listener.Username
 	proxyPassword := cfg.Listener.Password
@@ -38,6 +45,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// Create and start BoxManager
 	boxMgr := boxmgr.New(cfg, monitorCfg)
 	if err := boxMgr.Start(ctx); err != nil {
+		_ = boxMgr.Close()
 		return fmt.Errorf("start box manager: %w", err)
 	}
 	defer boxMgr.Close()
@@ -51,10 +59,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	subMgr := subscription.New(cfg, boxMgr)
 	defer subMgr.Stop()
 
-	// Start refresh loop only if subscriptions are already configured
-	if cfg.SubscriptionRefresh.Enabled && len(cfg.Subscriptions) > 0 {
-		subMgr.Start()
-	}
+	// Keep the manual-refresh worker available even when the periodic timer is
+	// disabled or URLs are configured later through the management interface.
+	subMgr.Start()
 
 	// Wire up subscription manager to monitor server for API endpoints
 	if server := boxMgr.MonitorServer(); server != nil {

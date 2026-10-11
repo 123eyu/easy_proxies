@@ -3,25 +3,26 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Easy Proxies - 监控中心</title>
+  <title>Easy Proxies · 运维控制台</title>
+  <meta name="color-scheme" content="dark light" />
   <style>
     :root {
       /* Dark Theme (Default) */
-      --bg-base: #0f172a;
-      --bg-panel: #1e293b;
-      --bg-hover: #334155;
-      --bg-input: #0f172a;
-      --border: #334155;
+      --bg-base: #0b1120;
+      --bg-panel: #131d2e;
+      --bg-hover: #23324a;
+      --bg-input: #0e1728;
+      --border: #2b3a50;
       --border-light: rgba(255, 255, 255, 0.1);
       --text-main: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #3b82f6;
+      --text-muted: #a0afc4;
+      --primary: #60a5fa;
       --primary-hover: #2563eb;
-      --success: #10b981;
+      --success: #34d399;
       --success-bg: rgba(16, 185, 129, 0.1);
       --warning: #f59e0b;
       --warning-bg: rgba(245, 158, 11, 0.1);
-      --error: #ef4444;
+      --error: #fb7185;
       --error-bg: rgba(239, 68, 68, 0.1);
       --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       --font-mono: "JetBrains Mono", "Fira Code", Consolas, monospace;
@@ -36,11 +37,14 @@
       --border: #e2e8f0;
       --border-light: rgba(0, 0, 0, 0.05);
       --text-main: #0f172a;
-      --text-muted: #64748b;
+      --text-muted: #475569;
       --primary: #2563eb;
       --primary-hover: #1d4ed8;
       --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
       --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+      --success: #047857;
+      --warning: #b45309;
+      --error: #be123c;
     }
 
     /* Minimalist Scrollbar */
@@ -375,6 +379,123 @@
       z-index: 10;
     }
     .chart-container { width: 100%; height: 100%; }
+
+    /* Operations console: compact data, calm surfaces, accessible controls. */
+    body { font-size: 14px; height: 100dvh; }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: wait; opacity: .55; }
+    :focus-visible { outline: 3px solid var(--primary); outline-offset: 3px; }
+    .skip-link { position: fixed; top: -80px; left: 12px; z-index: 10000; padding: 12px; background: var(--bg-panel); color: var(--text-main); }
+    .skip-link:focus { top: 12px; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .sidebar { width: 224px; flex-shrink: 0; background: var(--bg-input); }
+    .brand { height: 84px; font-size: 17px; letter-spacing: -.4px; }
+    .brand-icon { width: 34px; height: 34px; animation: none; box-shadow: none; background: rgba(59,130,246,.15); }
+    .brand-caption { display: block; margin-top: 3px; font-size: 10px; font-weight: 500; letter-spacing: 1.4px; color: var(--text-muted); }
+    .nav { padding: 8px 12px; }
+    .nav-label { padding: 6px 12px 12px; color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: 1.8px; }
+    .nav-item { width: 100%; min-height: 46px; margin-bottom: 5px; padding: 12px; border: 1px solid transparent; border-radius: 8px; background: transparent; font: inherit; text-align: left; }
+    .nav-item.active { border: 1px solid rgba(96,165,250,.22); background: rgba(59,130,246,.13); font-weight: 600; }
+    .nav-item svg { width: 18px; height: 18px; flex-shrink: 0; }
+    .main { position: relative; min-width: 0; }
+    .header { min-height: 74px; height: auto; flex-shrink: 0; padding: 16px 28px; gap: 16px; flex-wrap: wrap; }
+    .header-actions { flex-wrap: wrap; gap: 8px; }
+    .header-title { font-size: 18px; font-weight: 650; letter-spacing: -.5px; }
+    .status-indicator { padding: 5px 9px; font-size: 11px; border: none; box-shadow: none; background: transparent; }
+    .status-dot { box-shadow: none; flex-shrink: 0; }
+    .status-indicator.stale .status-dot { background: var(--warning); }
+    .content { padding: 26px 28px 40px; }
+    .content > .tab-content { max-width: 1680px; margin: 0 auto; }
+    .page-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 22px; }
+    .page-heading h1 { font-size: 25px; letter-spacing: -.8px; margin-bottom: 6px; }
+    .muted, .page-heading p { color: var(--text-muted); font-size: 13px; line-height: 1.7; }
+    .eyebrow { color: var(--primary); font-size: 10px; font-weight: 700; letter-spacing: 1.7px; margin-bottom: 8px; }
+    .btn { min-height: 36px; padding: 8px 12px; font-size: 12px; border-radius: 7px; background: var(--bg-panel); transition: background .18s, border-color .18s; }
+    .btn:hover { filter: none; background: var(--bg-hover); border-color: var(--text-muted); }
+    .btn-primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .btn-primary:hover { background: #1d4ed8; border-color: #1d4ed8; }
+    .btn-danger { color: var(--error); background: var(--error-bg); border-color: transparent; }
+    .btn-sm { min-height: 32px; font-size: 12px; padding: 6px 10px; }
+    .btn svg, .inline-icon { width: 16px; height: 16px; flex-shrink: 0; }
+    .theme-toggle { width: 36px; height: 36px; border: 1px solid var(--border); }
+    .overview-grid { gap: 12px; margin-bottom: 22px; }
+    .stat-panel { border-radius: 10px; padding: 17px; box-shadow: none; }
+    .stat-panel:hover { transform: none; box-shadow: none; }
+    .stat-value { font-size: 28px; font-weight: 600; letter-spacing: -1px; font-variant-numeric: tabular-nums; }
+    .stat-title { font-size: 11px; margin-bottom: 12px; }
+    .stat-sub { font-size: 11px; margin-top: 10px; color: var(--text-muted); }
+    .panel, .chart-panel { box-shadow: none; border-radius: 10px; }
+    .charts-grid { grid-template-columns: repeat(auto-fit,minmax(min(100%,300px),1fr)); gap: 14px; margin-bottom: 22px; }
+    .chart-panel { height: 280px; }
+    .chart-title { font-size: 12px; }
+    .panel-header { min-height: 60px; padding: 16px 20px; gap: 12px; flex-wrap: wrap; }
+    th { padding: 12px 18px; letter-spacing: .4px; font-size: 11px; white-space: nowrap; }
+    td { padding: 13px 18px; font-size: 12px; }
+    tbody tr:hover { background: var(--bg-input); }
+    .badge { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; padding: 4px 8px; border-color: transparent; font-size: 11px; }
+    .region-btn { min-height: 32px; border-radius: 6px; padding: 6px 10px; }
+    .region-filters { margin-bottom: 12px; gap: 6px; }
+    .filter-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+    .search-field { position: relative; flex: 1; min-width: 180px; max-width: 380px; }
+    .search-field svg { position: absolute; left: 12px; top: 12px; width: 16px; height: 16px; color: var(--text-muted); pointer-events: none; }
+    .search-field input { width: 100%; padding-left: 36px !important; }
+    .filter-count { margin-left: auto; color: var(--text-muted); font-size: 12px; }
+    .setting-input, input[type="text"], input[type="password"], input[type="number"] { min-height: 40px; font-size: 13px; }
+    select.setting-input { cursor: pointer; min-width: 120px; }
+    .notice { display: flex; gap: 10px; align-items: flex-start; padding: 12px 15px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-input); color: var(--text-muted); font-size: 12px; line-height: 1.7; }
+    .notice strong { color: var(--text-main); }
+    .notice svg { color: var(--primary); margin-top: 2px; }
+    .error-banner { margin-bottom: 18px; border-color: var(--error); color: var(--error); }
+    .access-card { padding: 18px 20px; display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 22px; background: linear-gradient(110deg,rgba(59,130,246,.10),var(--bg-panel)); }
+    .access-card h2 { font-size: 15px; margin-bottom: 5px; }
+    .access-card p { color: var(--text-muted); font-size: 12px; line-height: 1.6; }
+    .session-grid { display: grid; grid-template-columns: minmax(0,1.5fr) minmax(260px,1fr); gap: 18px; margin-bottom: 22px; }
+    .session-form { padding: 20px; }
+    .form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; }
+    .form-help { font-size: 11px; line-height: 1.6; color: var(--text-muted); }
+    .session-id-row { display: flex; gap: 8px; }
+    .session-id-row input { min-width: 0; flex: 1; }
+    .generated-link { margin-top: 18px; padding: 15px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-input); }
+    .generated-link code { display: block; padding: 10px 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.7; }
+    .copy-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .session-stats { padding: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .session-stats dt { color: var(--text-muted); font-size: 12px; margin-bottom: 8px; }
+    .session-stats dd { font-family: var(--font-mono); font-size: 20px; font-weight: 600; }
+    .session-table { min-width: 850px; }
+    .empty-message { padding: 36px 20px; text-align: center; color: var(--text-muted); font-size: 13px; line-height: 1.8; }
+    .modal { width: min(440px,calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; border-radius: 12px; }
+    .toast-container { max-width: calc(100vw - 32px); right: 16px; bottom: 16px; }
+    .toast { line-height: 1.5; max-width: 440px; }
+    .mobile-menu { display: none; }
+    [hidden] { display: none !important; }
+    @media (max-width: 1100px) { .overview-grid { grid-template-columns: repeat(3,minmax(0,1fr)); } .header-actions { gap: 6px; } }
+    @media (max-width: 900px) { .sidebar { width: 190px; } .header,.content { padding-left: 20px; padding-right: 20px; } .session-grid { grid-template-columns: minmax(0,1fr); } }
+    @media (max-width: 700px) {
+      .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 900; width: 224px; transform: translateX(-100%); visibility: hidden; transition: none; }
+      body.nav-open .sidebar { transform: translateX(0); visibility: visible; transition: transform .18s; }
+      .sidebar-backdrop { position: fixed; inset: 0; z-index: 800; background: rgba(0,0,0,.55); }
+      .mobile-menu { display: inline-flex; }
+      .header { padding: 14px 16px; gap: 12px; }
+      .header-left { gap: 8px; flex-wrap: wrap; }
+      .header-actions { width: 100%; }
+      .header-actions .btn { flex: 1 0 auto; }
+      .content { padding: 20px 16px 32px; }
+      .overview-grid { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
+      .stat-panel { padding: 14px; min-width: 0; }
+      .stat-value { font-size: 25px; }
+      .page-heading,.access-card { flex-direction: column; align-items: flex-start; }
+      .page-heading h1 { font-size: 23px; }
+      .form-grid,.checkbox-grid,#settingsTab [style*="grid-template-columns"] { grid-template-columns: minmax(0,1fr) !important; }
+      .btn,.btn-sm,.theme-toggle,.region-btn { min-height: 44px; }
+      .theme-toggle { width: 44px; }
+      input,select,textarea { font-size: 16px !important; }
+      .panel-header,.session-form { padding: 16px; }
+      .filter-count { margin-left: 0; }
+      .progress-float { top: 6px; right: 10px; max-width: calc(100vw - 20px); gap: 10px; padding: 7px 10px; }
+      #manageTab > div:first-child { flex-wrap: wrap; gap: 12px; }
+    }
+    @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
   <script>
@@ -393,42 +514,59 @@
   </script>
 </head>
 <body>
+  <a class="skip-link" href="#mainContent">跳到主内容</a>
+  <svg style="display:none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-2l2 2M4 17l2 2a7 7 0 0 0 12-2"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="m3 12 4 0 3-8 4 16 3-8h4"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="m10 13 4-4m-6 6-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2 3 1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 4v16M4 12h16"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v1"/></symbol>
+  </defs></svg>
+  <button class="sidebar-backdrop" id="sidebarBackdrop" hidden aria-label="关闭导航菜单" onclick="toggleSidebar(false)"></button>
 
   <!-- Sidebar -->
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar" aria-label="主导航">
     <div class="brand">
       <div class="brand-icon">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
           <path d="M2 16l4-4 4 6 4-10 4 4 4-6" stroke="url(#brandGrad)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <animate attributeName="stroke-dasharray" values="0,100;50,0;0,100" dur="3s" repeatCount="indefinite"/>
           </path>
           <defs><linearGradient id="brandGrad" x1="0" y1="0" x2="24" y2="0"><stop offset="0%" stop-color="#60a5fa"/><stop offset="100%" stop-color="#a78bfa"/></linearGradient></defs>
         </svg>
       </div>
-      Easy Proxies
+      <span>Easy Proxies<span class="brand-caption">NETWORK OPERATIONS</span></span>
     </div>
-    <div class="nav">
-      <div class="nav-item active" onclick="switchTab('dashboard')">
+    <nav class="nav" aria-label="控制台页面">
+      <div class="nav-label">WORKSPACE</div>
+      <button type="button" class="nav-item active" onclick="switchTab('dashboard')" aria-controls="dashboardTab" aria-current="page">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
         监控看板
-      </div>
-      <div class="nav-item" onclick="switchTab('manage')">
+      </button>
+      <button type="button" class="nav-item" onclick="switchTab('sessions')" aria-controls="sessionsTab">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-link"/></svg>
+        会话路由
+      </button>
+      <button type="button" class="nav-item" onclick="switchTab('manage')" aria-controls="manageTab">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
         节点配置
-      </div>
-      <div class="nav-item" onclick="switchTab('debug')">
+      </button>
+      <button type="button" class="nav-item" onclick="switchTab('debug')" aria-controls="debugTab">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
         诊断分析
-      </div>
-      <div class="nav-item" onclick="switchTab('logs')">
+      </button>
+      <button type="button" class="nav-item" onclick="switchTab('logs')" aria-controls="logsTab">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg>
         控制台日志
-      </div>
-      <div class="nav-item" onclick="switchTab('settings')">
+      </button>
+      <button type="button" class="nav-item" onclick="switchTab('settings')" aria-controls="settingsTab">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         系统设置
-      </div>
-    </div>
+      </button>
+    </nav>
     <div style="padding: 0 20px 16px; text-align: center;">
       <a href="https://github.com/jasonwong1991/easy_proxies" target="_blank" rel="noopener" style="display:inline-flex; align-items:center; gap:6px; color:var(--text-muted); text-decoration:none; font-size:12px; padding:6px 10px; border-radius:6px; border:1px solid var(--border); transition:all 0.2s;" onmouseover="this.style.borderColor='var(--primary)';this.style.color='var(--text-main)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-muted)'">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -439,7 +577,7 @@
   </aside>
 
   <!-- Main Content -->
-  <main class="main">
+  <main class="main" id="mainContent" tabindex="-1">
     <div class="progress-wrapper" id="probeProgress">
       <div class="progress-bar"><div class="progress-fill" id="probeProgressFill"></div></div>
       <div class="progress-float">
@@ -452,30 +590,36 @@
     <!-- Header -->
     <header class="header">
       <div class="header-left">
-        <div class="status-indicator">
+        <button type="button" class="btn mobile-menu" id="mobileMenuBtn" aria-label="打开导航菜单" aria-controls="sidebar" aria-expanded="false" onclick="toggleSidebar()"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-menu"/></svg></button>
+        <span class="header-title" id="pageTitle">监控看板</span>
+        <div class="status-indicator" id="connectionStatus">
           <div class="status-dot"></div>
-          <span id="lastUpdate">System Online</span>
+          <span id="lastUpdate">正在连接…</span>
         </div>
       </div>
       <div class="header-actions">
-        <button class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" title="切换主题" data-mode="auto">
+        <button type="button" class="btn" id="logoutBtn" onclick="logout()" hidden>退出登录</button>
+        <button class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" aria-label="切换深色、浅色或系统主题" title="切换主题" data-mode="auto">
           <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
           <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
           <svg class="icon-auto" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
           <span class="theme-mode-label" id="themeModeLabel">跟随系统</span>
         </button>
-        <button class="btn btn-primary" onclick="probeAllNodes()">⚡ 批量探测</button>
+        <button class="btn btn-primary" onclick="probeAllNodes()"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-activity"/></svg> 批量探测</button>
         <button class="btn" id="refreshSubBtn" onclick="refreshSubscription()" style="display:none;">刷新订阅</button>
-        <button class="btn" onclick="exportNodes()">导出配置</button>
-        <button class="btn" onclick="exportNodes(true)">全部导出</button>
-        <button class="btn" onclick="toggleAutoRefresh()" id="autoRefreshBtn">⏹ 关闭自动刷新</button>
-        <button class="btn" onclick="refresh()">↺ 刷新</button>
+        <button class="btn" onclick="exportNodes()"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-download"/></svg> 导出可用</button>
+        <button class="btn" onclick="exportNodes(true)">导出全部</button>
+        <button class="btn" onclick="toggleAutoRefresh()" id="autoRefreshBtn">自动刷新 · 开</button>
+        <button class="btn" onclick="refresh()"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-refresh"/></svg> 刷新</button>
       </div>
     </header>
 
     <div class="content">
+      <div class="notice error-banner" id="globalError" role="alert" hidden></div>
       <!-- Dashboard Tab -->
-      <div id="dashboardTab" class="tab-content active">
+      <div id="dashboardTab" class="tab-content active" aria-labelledby="pageTitle">
+        <div class="page-heading"><div><div class="eyebrow">LIVE OVERVIEW</div><h1>每一条连接，尽在掌握。</h1><p>节点健康、流量与路由状态，一屏实时掌握。</p></div></div>
+        <div class="panel access-card"><div><h2>一个入口，多条独立会话</h2><p>普通用户名按池策略调度；用户名加 .会话ID 固定出口，适用于 HTTP 与 SOCKS5。</p></div><button type="button" class="btn btn-primary" onclick="switchTab('sessions')">生成接入链接 <svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-arrow"/></svg></button></div>
         <div class="overview-grid">
           <div class="stat-panel">
             <div class="stat-title">总节点数</div>
@@ -485,12 +629,12 @@
           <div class="stat-panel">
             <div class="stat-title">健康在线</div>
             <div class="stat-value" style="color: var(--success);" id="healthyNodes">0</div>
-            <div class="stat-sub">Active & Ready</div>
+            <div class="stat-sub">通过健康检查</div>
           </div>
           <div class="stat-panel">
             <div class="stat-title">活跃连接数</div>
             <div class="stat-value" style="color: var(--primary);" id="activeConnections">0</div>
-            <div class="stat-sub">当前建立会话</div>
+            <div class="stat-sub">正在使用的连接</div>
           </div>
           <div class="stat-panel">
             <div class="stat-title">异常/拉黑</div>
@@ -511,31 +655,37 @@
 
         <div class="charts-grid">
           <div class="chart-panel">
-            <div class="chart-title">地域连通率 (Region Availability)</div>
-            <div class="chart-container" id="regionChart"></div>
+            <div class="chart-title">地域连通率 (REGIONS)</div>
+            <div class="chart-container" role="img" aria-label="运行统计图表，数据详见下方节点表" id="regionChart"></div>
           </div>
           <div class="chart-panel">
-            <div class="chart-title">最优节点延迟 (Top Fastest Nodes)</div>
-            <div class="chart-container" id="latencyChart"></div>
+            <div class="chart-title">最优节点延迟 (LATENCY)</div>
+            <div class="chart-container" role="img" aria-label="运行统计图表，数据详见下方节点表" id="latencyChart"></div>
           </div>
           <div class="chart-panel">
-            <div class="chart-title">实时流量带宽 (Real-time Traffic)</div>
-            <div class="chart-container" id="trafficChart"></div>
+            <div class="chart-title">实时流量带宽 (TRAFFIC) <span id="trafficStatus" role="status" class="form-help">连接中…</span></div>
+            <div class="chart-container" role="img" aria-label="运行统计图表，数据详见下方节点表" id="trafficChart"></div>
           </div>
         </div>
 
         <div class="region-filters" id="regionFilter">
           <span style="color: var(--text-muted); font-size: 12px; margin-top: 4px;">过滤:</span>
-          <button class="region-btn active" data-region="all" onclick="filterByRegion('all')">All</button>
-          <button class="region-btn" data-region="jp" onclick="filterByRegion('jp')">🇯🇵 JP</button>
-          <button class="region-btn" data-region="kr" onclick="filterByRegion('kr')">🇰🇷 KR</button>
-          <button class="region-btn" data-region="us" onclick="filterByRegion('us')">🇺🇸 US</button>
-          <button class="region-btn" data-region="hk" onclick="filterByRegion('hk')">🇭🇰 HK</button>
-          <button class="region-btn" data-region="tw" onclick="filterByRegion('tw')">🇹🇼 TW</button>
-          <button class="region-btn" data-region="sg" onclick="filterByRegion('sg')">🇸🇬 SG</button>
-          <button class="region-btn" data-region="other" onclick="filterByRegion('other')">Other</button>
+          <button class="region-btn active" data-region="all" onclick="filterByRegion('all')">全部地区</button>
+          <button class="region-btn" data-region="jp" onclick="filterByRegion('jp')">JP</button>
+          <button class="region-btn" data-region="kr" onclick="filterByRegion('kr')">KR</button>
+          <button class="region-btn" data-region="us" onclick="filterByRegion('us')">US</button>
+          <button class="region-btn" data-region="hk" onclick="filterByRegion('hk')">HK</button>
+          <button class="region-btn" data-region="tw" onclick="filterByRegion('tw')">TW</button>
+          <button class="region-btn" data-region="sg" onclick="filterByRegion('sg')">SG</button>
+          <button class="region-btn" data-region="other" onclick="filterByRegion('other')">其他</button>
         </div>
 
+        <div class="filter-toolbar">
+          <label class="search-field"><span class="sr-only">搜索节点名称、标签或地域</span><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="nodeSearch" class="setting-input" placeholder="搜索节点名称、标签或地域" oninput="applyNodeFilters(true)" /></label>
+          <label><span class="sr-only">按节点状态筛选</span><select id="nodeStatusFilter" class="setting-input" onchange="applyNodeFilters(true)"><option value="all">所有状态</option><option value="healthy">健康在线</option><option value="pending">等待检查</option><option value="unavailable">不可用</option><option value="blacklisted">已拉黑</option></select></label>
+          <label><span class="sr-only">节点排序</span><select id="nodeSort" class="setting-input" onchange="applyNodeFilters(true)"><option value="default">默认顺序</option><option value="latency">延迟优先</option><option value="connections">连接数优先</option><option value="failures">失败次数优先</option><option value="name">名称排序</option></select></label>
+          <span class="filter-count" id="nodeFilterCount"></span>
+        </div>
         <div class="panel">
           <div class="panel-header">
             <div class="panel-title">节点监控列表</div>
@@ -544,14 +694,14 @@
             <table>
               <thead>
                 <tr>
-                  <th>状态</th>
-                  <th>地域</th>
-                  <th>名称 (Name/Tag)</th>
-                  <th>端口</th>
-                  <th>延迟 / 质量</th>
-                  <th>连接</th>
-                  <th>失败</th>
-                  <th>操作</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">地域</th>
+                  <th scope="col">名称 (Name/Tag)</th>
+                  <th scope="col">端口</th>
+                  <th scope="col">延迟 / 质量</th>
+                  <th scope="col">连接</th>
+                  <th scope="col">失败</th>
+                  <th scope="col">操作</th>
                 </tr>
               </thead>
               <tbody id="nodesTableBody">
@@ -564,6 +714,32 @@
         </div>
       </div>
 
+      <!-- Session Routing Tab -->
+      <section id="sessionsTab" class="tab-content" aria-labelledby="sessionPageHeading">
+        <div class="page-heading"><div><div class="eyebrow">SESSION ROUTING</div><h1 id="sessionPageHeading">稳定出口，按会话掌控。</h1><p>主端口支持普通调度与命名会话。不同会话 ID 独立选择上游，同一个 ID 保持绑定。</p></div><button type="button" class="btn" onclick="loadProxySessions()"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-refresh"/></svg> 刷新绑定</button></div>
+        <div class="notice" id="sessionAvailability" role="status" style="margin-bottom:18px">正在读取会话路由状态…</div>
+        <div class="session-grid">
+          <div class="panel">
+            <div class="panel-header"><div class="panel-title">接入链接生成器</div><span class="badge badge-offline">主入口</span></div>
+            <form class="session-form" onsubmit="generateProxyLink(event)">
+              <div class="form-grid">
+                <div class="form-group"><label for="proxyLinkMode">路由方式</label><select id="proxyLinkMode" class="setting-input" onchange="updateProxyLinkMode()"><option value="session">命名会话 · 固定出口</option><option value="normal">普通连接 · 按池调度</option></select></div>
+                <div class="form-group"><label for="proxyLinkScheme">代理协议</label><select id="proxyLinkScheme" class="setting-input" onchange="clearGeneratedLink()"><option value="http">HTTP / CONNECT</option><option value="socks5">SOCKS5</option></select></div>
+              </div>
+              <div class="form-group" id="proxySessionIDField" style="margin-top:16px"><label for="proxySessionID">会话 ID</label><div class="session-id-row"><input type="text" id="proxySessionID" class="setting-input" maxlength="64" pattern="[A-Za-z0-9_-]{1,64}" required autocomplete="off" placeholder="例如 task_01" oninput="clearGeneratedLink()" /><button type="button" class="btn" onclick="randomizeSessionID()">随机生成</button></div><p class="form-help" id="sessionIDHelp">1–64 位英文字母、数字、下划线或连字符。完整用户名为 基础用户名.会话ID。</p></div>
+              <button type="submit" class="btn btn-primary" id="generateLinkBtn" style="margin-top:18px"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-link"/></svg> 生成接入链接</button>
+              <div class="notice error-banner" id="linkError" role="alert" hidden style="margin-top:16px;margin-bottom:0"></div>
+              <div class="generated-link" id="generatedLink" hidden><span class="form-help">接入 URL · 密码已遮蔽</span><code id="maskedProxyURL"></code><div class="copy-actions"><button type="button" class="btn" onclick="copyProxyLink('url')">复制完整 URL</button><button type="button" class="btn" onclick="copyProxyLink('curl')">复制 curl 命令</button></div><p class="form-help" style="margin-top:10px">复制内容包含真实凭据，请妥善保管；不会保存到浏览器本地存储。</p></div>
+            </form>
+          </div>
+          <div class="panel"><div class="panel-header"><div class="panel-title">绑定策略</div><span class="badge badge-offline" id="sessionEnabledBadge">读取中</span></div><dl class="session-stats"><div><dt>当前绑定</dt><dd id="proxySessionTotal">—</dd></div><div><dt>容量上限</dt><dd id="proxySessionCapacity">—</dd></div><div><dt>空闲有效期</dt><dd id="proxySessionTTL" style="font-size:16px">—</dd></div><div><dt>接入方式</dt><dd style="font-size:15px">HTTP / SOCKS5</dd></div></dl><div class="notice" style="margin:0 20px 20px"><svg class="inline-icon" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-info"/></svg><div><strong>首次连接建立绑定</strong><br/>生成链接不会预选节点。会话空闲到期、手动重置或节点失效后，下次连接重新选路。重置不主动关闭现有连接。</div></div></div>
+        </div>
+        <div class="panel"><div class="panel-header"><div><div class="panel-title">会话绑定</div><p class="form-help" style="margin-top:5px">绑定按节点身份跨订阅刷新 / 核心重载保留；进程重启清空。</p></div><button type="button" class="btn btn-danger" id="clearSessionsBtn" onclick="resetProxySessions()" disabled>重置全部绑定</button></div>
+          <div class="filter-toolbar" style="padding:16px 20px 0"><label class="search-field"><span class="sr-only">搜索会话 ID 或上游节点</span><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="proxySessionSearch" class="setting-input" placeholder="搜索会话 ID、用户名或节点" oninput="renderProxySessions()" /></label><span class="filter-count" id="sessionFilterCount"></span></div>
+          <div class="table-container"><table class="session-table"><caption class="sr-only">命名代理会话的节点绑定与有效期</caption><thead><tr><th scope="col">会话 / 用户名</th><th scope="col">绑定节点</th><th scope="col">首次绑定</th><th scope="col">最近使用 / 到期</th><th scope="col">切换</th><th scope="col">操作</th></tr></thead><tbody id="proxySessionsBody"></tbody></table></div><div class="empty-message" id="proxySessionsEmpty">正在加载绑定…</div><div id="sessionPagingHint" class="empty-message" hidden></div>
+        </div>
+      </section>
+
       <!-- Manage Tab -->
       <div id="manageTab" class="tab-content">
         <div style="display:flex; justify-content:space-between; margin-bottom: 20px;">
@@ -572,21 +748,23 @@
             <p style="color: var(--text-muted); font-size: 12px;">修改配置后点击上方重载按钮生效</p>
           </div>
           <div style="display:flex; gap: 10px;">
-            <button class="btn btn-primary" onclick="showAddNodeModal()">➕ 添加节点</button>
-            <button class="btn btn-warning" onclick="triggerReload()" id="reloadBtn" style="color:#000;">⚡ 重载核心</button>
+            <button class="btn btn-primary" onclick="showAddNodeModal()"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-plus"/></svg> 添加节点</button>
+            <button class="btn btn-warning" onclick="triggerReload()" id="reloadBtn" >重载核心</button>
           </div>
         </div>
         
         <div id="subscriptionWarning" style="display:none; background: rgba(245, 158, 11, 0.1); border: 1px solid var(--warning); padding: 12px; border-radius: 6px; color: var(--warning); margin-bottom: 16px; font-size: 12px;">
-          ⚠️ 警告：当前使用订阅模式。手动修改配置将在下次订阅刷新时被覆盖。
+          提示：当前使用订阅模式。手动修改配置将在下次订阅刷新时被覆盖。
         </div>
 
+        <div class="filter-toolbar"><label class="search-field"><span class="sr-only">搜索配置节点</span><input type="search" id="configNodeSearch" class="setting-input" placeholder="搜索节点名称、URI 或来源" oninput="renderConfigNodes(true)" /></label><span class="filter-count" id="configFilterCount"></span></div>
         <div class="panel">
           <div class="table-container">
             <table>
-              <thead><tr><th>名称</th><th>URI</th><th>端口</th><th>来源</th><th>操作</th></tr></thead>
+              <thead><tr><th scope="col">名称</th><th scope="col">URI</th><th scope="col">端口</th><th scope="col">来源</th><th scope="col">操作</th></tr></thead>
               <tbody id="configNodesTableBody"></tbody>
             </table>
+            <div id="configNodesEmpty" class="empty-message" hidden>暂无匹配节点。</div><div id="configNodesPaging" class="empty-message" hidden></div>
           </div>
         </div>
       </div>
@@ -611,29 +789,31 @@
         <div class="charts-grid">
           <div class="chart-panel">
             <div class="chart-title">全局质量分数 (Overall Health Score)</div>
-            <div class="chart-container" id="successRateChart"></div>
+            <div class="chart-container" role="img" aria-label="运行统计图表，数据详见下方节点表" id="successRateChart"></div>
           </div>
           <div class="chart-panel">
             <div class="chart-title">稳定性掉线排行 (Top Unstable Nodes)</div>
-            <div class="chart-container" id="failureChart"></div>
+            <div class="chart-container" role="img" aria-label="运行统计图表，数据详见下方节点表" id="failureChart"></div>
           </div>
         </div>
 
+        <div class="filter-toolbar"><label class="search-field"><span class="sr-only">搜索诊断节点</span><input type="search" id="debugNodeSearch" class="setting-input" placeholder="搜索节点名称或标签" oninput="renderDebugNodes(true)" /></label><span class="filter-count" id="debugFilterCount"></span></div>
         <div class="panel">
           <div class="panel-header"><div class="panel-title">节点质量分析</div></div>
           <div class="table-container">
             <table>
               <thead>
                 <tr>
-                  <th>节点</th>
-                  <th>成功率</th>
-                  <th>成功 / 失败</th>
-                  <th>连接</th>
-                  <th>最近调用时间线</th>
+                  <th scope="col">节点</th>
+                  <th scope="col">成功率</th>
+                  <th scope="col">成功 / 失败</th>
+                  <th scope="col">连接</th>
+                  <th scope="col">最近调用时间线</th>
                 </tr>
               </thead>
               <tbody id="debugNodesTableBody"></tbody>
             </table>
+            <div id="debugNodesEmpty" class="empty-message" hidden>暂无匹配节点。</div><div id="debugNodesPaging" class="empty-message" hidden></div>
           </div>
         </div>
       </div>
@@ -642,10 +822,10 @@
       <div id="logsTab" class="tab-content">
         <div class="panel">
           <div class="panel-header">
-            <div class="panel-title">控制台日志 (Console Logs)</div>
+            <div class="panel-title">控制台日志 (Console Logs) <span id="logStatus" role="status" class="form-help"></span></div>
             <div style="display:flex; align-items:center; gap:12px;">
               <label style="font-size:13px; color:var(--text-muted); display:flex; align-items:center; gap:6px;"><input type="checkbox" id="autoScrollLogs" checked> 自动滚动</label>
-              <button class="btn btn-sm" onclick="pollLogs()">↺ 刷新</button>
+              <button class="btn btn-sm" onclick="pollLogs()"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-refresh"/></svg> 刷新</button>
             </div>
           </div>
           <div style="padding: 0;">
@@ -658,13 +838,14 @@
       <div id="settingsTab" class="tab-content">
         <div style="max-width: 800px; margin: 0 auto;">
           <div style="font-size: 20px; font-weight: 700; margin-bottom: 24px; color: var(--text-main);">系统设置</div>
+          <div id="savedSettingsPending" class="notice" hidden style="margin-bottom:16px"><div><strong>核心设置已保存，等待应用</strong><br/>管理密码已立即生效。其余核心设置需要重载；当前未保存的订阅草稿仍可编辑。</div><button type="button" class="btn" onclick="triggerReload()">重载核心</button></div>
           <form onsubmit="handleSettingsSave(event)">
 
             <div class="panel" style="margin-bottom: 16px;">
               <div class="panel-header"><div class="panel-title">基础配置</div></div>
               <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
                 <div class="form-group">
-                  <label>运行模式 (Mode)</label>
+                  <label for="settingMode">运行模式 (Mode)</label>
                   <select id="settingMode" class="setting-input">
                     <option value="pool">pool - 单端口负载池</option>
                     <option value="multi-port">multi-port - 多端口模式</option>
@@ -672,11 +853,11 @@
                   </select>
                 </div>
                 <div class="form-group">
-                  <label>外部 IP (External IP)</label>
+                  <label for="settingExternalIP">外部 IP (External IP)</label>
                   <input type="text" id="settingExternalIP" class="setting-input" placeholder="0.0.0.0" />
                 </div>
                 <div class="form-group">
-                  <label>探测目标 (Probe Target)</label>
+                  <label for="settingProbeTarget">探测目标 (Probe Target)</label>
                   <input type="text" id="settingProbeTarget" class="setting-input" placeholder="www.apple.com:80" />
                 </div>
                 <div class="form-group" style="justify-content:flex-end;">
@@ -689,20 +870,20 @@
             <div class="panel" style="margin-bottom: 16px;">
               <div class="panel-header"><div class="panel-title">监听配置 (Listener)</div></div>
               <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
-                <div class="form-group"><label>监听地址</label><input type="text" id="settingListenerAddr" class="setting-input" placeholder="0.0.0.0" /></div>
-                <div class="form-group"><label>监听端口</label><input type="number" id="settingListenerPort" class="setting-input" min="1" max="65535" placeholder="7890" /></div>
-                <div class="form-group"><label>用户名 (可选)</label><input type="text" id="settingListenerUser" class="setting-input" /></div>
-                <div class="form-group"><label>密码 (可选)</label><input type="password" id="settingListenerPass" class="setting-input" /></div>
+                <div class="form-group"><label for="settingListenerAddr">监听地址</label><input type="text" id="settingListenerAddr" class="setting-input" placeholder="0.0.0.0" /></div>
+                <div class="form-group"><label for="settingListenerPort">监听端口</label><input type="number" id="settingListenerPort" class="setting-input" min="1" max="65535" placeholder="7890" /></div>
+                <div class="form-group"><label for="settingListenerUser">用户名 (可选)</label><input type="text" id="settingListenerUser" class="setting-input" /></div>
+                <div class="form-group"><label for="settingListenerPass">密码 (可选)</label><input type="password" id="settingListenerPass" class="setting-input" /></div>
               </div>
             </div>
 
             <div class="panel" style="margin-bottom: 16px;">
               <div class="panel-header"><div class="panel-title">多端口配置 (Multi-Port)</div></div>
               <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
-                <div class="form-group"><label>监听地址</label><input type="text" id="settingMPAddr" class="setting-input" placeholder="0.0.0.0" /></div>
-                <div class="form-group"><label>起始端口</label><input type="number" id="settingMPBasePort" class="setting-input" min="1" max="65535" placeholder="10000" /></div>
-                <div class="form-group"><label>用户名 (可选)</label><input type="text" id="settingMPUser" class="setting-input" /></div>
-                <div class="form-group"><label>密码 (可选)</label><input type="password" id="settingMPPass" class="setting-input" /></div>
+                <div class="form-group"><label for="settingMPAddr">监听地址</label><input type="text" id="settingMPAddr" class="setting-input" placeholder="0.0.0.0" /></div>
+                <div class="form-group"><label for="settingMPBasePort">起始端口</label><input type="number" id="settingMPBasePort" class="setting-input" min="1" max="65535" placeholder="10000" /></div>
+                <div class="form-group"><label for="settingMPUser">用户名 (可选)</label><input type="text" id="settingMPUser" class="setting-input" /></div>
+                <div class="form-group"><label for="settingMPPass">密码 (可选)</label><input type="password" id="settingMPPass" class="setting-input" /></div>
               </div>
             </div>
 
@@ -710,30 +891,33 @@
               <div class="panel-header"><div class="panel-title">节点池配置 (Pool)</div></div>
               <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;">
                 <div class="form-group">
-                  <label>调度模式</label>
+                  <label for="settingPoolMode">调度模式</label>
                   <select id="settingPoolMode" class="setting-input">
                     <option value="random">random - 随机</option>
-                    <option value="round-robin">round-robin - 轮询</option>
+                    <option value="sequential">sequential - 轮询</option>
                     <option value="balance">balance - 均衡</option>
                     <option value="latency">latency - 最低延迟</option>
                   </select>
                 </div>
-                <div class="form-group"><label>故障阈值</label><input type="number" id="settingPoolFailure" class="setting-input" min="1" max="100" placeholder="3" /></div>
-                <div class="form-group"><label>黑名单时长</label><input type="text" id="settingPoolBlacklist" class="setting-input" placeholder="24h" /></div>
-                <div class="form-group"><label>暂时性故障冷却</label><input type="text" id="settingPoolTransient" class="setting-input" placeholder="60s" /></div>
-                <div class="form-group"><label>429 限流冷却</label><input type="text" id="settingPoolRateLimit" class="setting-input" placeholder="60s" /></div>
+                <div class="form-group"><label for="settingPoolFailure">故障阈值</label><input type="number" id="settingPoolFailure" class="setting-input" min="1" max="100" placeholder="3" /></div>
+                <div class="form-group"><label for="settingPoolBlacklist">黑名单时长</label><input type="text" id="settingPoolBlacklist" class="setting-input" placeholder="24h" /></div>
+                <div class="form-group"><label for="settingPoolTransient">暂时性故障冷却</label><input type="text" id="settingPoolTransient" class="setting-input" placeholder="60s" /></div>
+                <div class="form-group"><label for="settingPoolRateLimit">429 限流冷却</label><input type="text" id="settingPoolRateLimit" class="setting-input" placeholder="60s" /></div>
               </div>
               <div style="font-size: 11px; color: var(--text-muted); padding: 0 16px 12px;">永久性故障（握手/证书/协议失败等）连续达到「故障阈值」后按「黑名单时长」拉黑。暂时性故障（超时、连接重置、503）和 429 限流不计入该阈值，只按对应冷却时间临时跳过该节点，到期自动恢复。支持 30s / 10m / 2h 等格式；想让 429 直接拉黑数小时，把「429 限流冷却」改成 2h 即可。</div>
             </div>
 
             <div class="panel" style="margin-bottom: 16px;">
-              <div class="panel-header"><div class="panel-title">粘性代理 (Sticky Session)</div></div>
+              <div class="panel-header"><div class="panel-title">会话路由与兼容入口</div></div>
               <div style="padding: 16px;">
+                <div class="checkbox-row" style="margin-bottom:16px"><input type="checkbox" id="settingSessionEnabled" /><label for="settingSessionEnabled">启用主端口命名会话（用户名.会话ID）</label></div>
+                <div class="form-grid" style="margin-bottom:16px"><div class="form-group"><label for="settingSessionTTL">会话空闲有效期</label><input type="text" id="settingSessionTTL" class="setting-input" placeholder="24h" /><span class="form-help">例如 30m、24h；每次连接续期，最长 8760h。</span></div><div class="form-group"><label for="settingSessionCapacity">最大绑定数</label><input type="number" id="settingSessionCapacity" class="setting-input" min="1" max="100000" placeholder="10000" /></div></div>
+                <div class="notice" style="margin-bottom:18px">命名会话使用主入口，无需额外端口；需要 pool / hybrid 模式并配置主入口用户名，使用相同密码认证。普通用户名仍采用原调度策略。</div>
                 <div class="checkbox-grid">
-                  <div class="checkbox-row"><input type="checkbox" id="settingStickyEnabled" /><label for="settingStickyEnabled">启用粘性代理（独立端口，按客户端来源 IP 固定上游节点）</label></div>
+                  <div class="checkbox-row"><input type="checkbox" id="settingStickyEnabled" /><label for="settingStickyEnabled">保留来源 IP 粘性入口（独立端口 · 兼容模式）</label></div>
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
-                  <div class="form-group"><label>粘性端口</label><input type="number" id="settingStickyPort" class="setting-input" min="1" max="65535" placeholder="2324（留空则为 listener 端口 +1）" /></div>
+                  <div class="form-group"><label for="settingStickyPort">来源 IP 粘性端口</label><input type="number" id="settingStickyPort" class="setting-input" min="1" max="65535" placeholder="2324（留空则为 listener 端口 +1）" /></div>
                 </div>
                 <div style="font-size: 11px; color: var(--text-muted); margin-top: 8px;">仅 pool / hybrid 模式生效。开启后会额外监听一个端口，与原 listener 端口共存；通过粘性端口接入的客户端会按来源 IP 永久绑定到同一上游节点（节点失效时自动重选）。</div>
               </div>
@@ -742,9 +926,9 @@
             <div class="panel" style="margin-bottom: 16px;">
               <div class="panel-header"><div class="panel-title">管理面板 (Management)</div></div>
               <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;">
-                <div class="form-group"><label>监听地址</label><input type="text" id="settingMgmtListen" class="setting-input" placeholder="0.0.0.0:8080" /></div>
-                <div class="form-group"><label>访问密码</label><input type="password" id="settingMgmtPassword" class="setting-input" /></div>
-                <div class="form-group"><label>探测并发数</label><input type="number" id="settingProbeConcurrency" class="setting-input" min="1" max="1024" placeholder="32" /></div>
+                <div class="form-group"><label for="settingMgmtListen">监听地址</label><input type="text" id="settingMgmtListen" class="setting-input" placeholder="0.0.0.0:8080" /></div>
+                <div class="form-group"><label for="settingMgmtPassword">访问密码</label><input type="password" id="settingMgmtPassword" class="setting-input" /></div>
+                <div class="form-group"><label for="settingProbeConcurrency">探测并发数</label><input type="number" id="settingProbeConcurrency" class="setting-input" min="1" max="1024" placeholder="32" /></div>
               </div>
               <div style="font-size: 11px; color: var(--text-muted); padding: 0 16px 12px;">探测并发数：初始/周期健康检查与批量探测的并发线程数（8-1024，默认 32），节点数多时调高可加快探测，修改后需重载核心生效</div>
             </div>
@@ -757,10 +941,10 @@
                   <div class="checkbox-row"><input type="checkbox" id="settingGeoIPAutoUpdate" /><label for="settingGeoIPAutoUpdate">自动更新数据库</label></div>
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
-                  <div class="form-group"><label>数据库路径</label><input type="text" id="settingGeoIPDBPath" class="setting-input" placeholder="./GeoLite2-Country.mmdb" /></div>
-                  <div class="form-group"><label>路由监听地址</label><input type="text" id="settingGeoIPListen" class="setting-input" /></div>
-                  <div class="form-group"><label>路由端口</label><input type="number" id="settingGeoIPPort" class="setting-input" min="1" max="65535" placeholder="1221" /></div>
-                  <div class="form-group"><label>更新间隔</label><input type="text" id="settingGeoIPUpdateInterval" class="setting-input" placeholder="24h" /></div>
+                  <div class="form-group"><label for="settingGeoIPDBPath">数据库路径</label><input type="text" id="settingGeoIPDBPath" class="setting-input" placeholder="./GeoLite2-Country.mmdb" /></div>
+                  <div class="form-group"><label for="settingGeoIPListen">路由监听地址</label><input type="text" id="settingGeoIPListen" class="setting-input" /></div>
+                  <div class="form-group"><label for="settingGeoIPPort">路由端口</label><input type="number" id="settingGeoIPPort" class="setting-input" min="1" max="65535" placeholder="1221" /></div>
+                  <div class="form-group"><label for="settingGeoIPUpdateInterval">更新间隔</label><input type="text" id="settingGeoIPUpdateInterval" class="setting-input" placeholder="24h" /></div>
                 </div>
                 <div style="font-size: 11px; color: var(--text-muted); margin-top: 8px;">首次启用会自动下载 GeoIP 数据库（约 9MB），需重载核心生效</div>
               </div>
@@ -771,7 +955,7 @@
               <div style="padding: 16px;">
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
                   <div class="form-group">
-                    <label>日志输出</label>
+                    <label for="settingLogOutput">日志输出</label>
                     <select id="settingLogOutput" class="setting-input" onchange="toggleLogFileSettings()">
                       <option value="stdout">仅控制台 (stdout)</option>
                       <option value="file">控制台 + 文件 (stdout + file)</option>
@@ -779,9 +963,9 @@
                   </div>
                 </div>
                 <div id="logFileSettings" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px;">
-                  <div class="form-group"><label>单文件最大 MB</label><input type="number" id="settingLogMaxSize" class="setting-input" min="1" max="1024" placeholder="50" /></div>
-                  <div class="form-group"><label>保留旧日志个数</label><input type="number" id="settingLogMaxBackups" class="setting-input" min="0" max="100" placeholder="3" /></div>
-                  <div class="form-group"><label>保留天数</label><input type="number" id="settingLogMaxAge" class="setting-input" min="0" max="365" placeholder="7" /></div>
+                  <div class="form-group"><label for="settingLogMaxSize">单文件最大 MB</label><input type="number" id="settingLogMaxSize" class="setting-input" min="1" max="1024" placeholder="50" /></div>
+                  <div class="form-group"><label for="settingLogMaxBackups">保留旧日志个数</label><input type="number" id="settingLogMaxBackups" class="setting-input" min="0" max="100" placeholder="3" /></div>
+                  <div class="form-group"><label for="settingLogMaxAge">保留天数</label><input type="number" id="settingLogMaxAge" class="setting-input" min="0" max="365" placeholder="7" /></div>
                   <div class="form-group" style="justify-content:flex-end;">
                     <label>&nbsp;</label>
                     <div class="checkbox-row"><input type="checkbox" id="settingLogCompress" /><label for="settingLogCompress">压缩旧日志</label></div>
@@ -799,7 +983,7 @@
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
                   <div class="form-group">
-                    <label>刷新间隔</label>
+                    <label for="settingSubInterval">刷新间隔</label>
                     <select id="settingSubInterval" class="setting-input">
                       <option value="10m">10 分钟</option><option value="30m">30 分钟</option>
                       <option value="1h">1 小时</option><option value="3h">3 小时</option>
@@ -809,7 +993,7 @@
                   </div>
                 </div>
                 <div class="form-group" style="margin-top: 12px;">
-                  <label>订阅链接 (每行一个 URL)</label>
+                  <label for="settingSubURLs">订阅链接 (每行一个 URL)</label>
                   <textarea id="settingSubURLs" rows="4" class="setting-input" placeholder="https://example.com/subscribe?token=xxx" style="resize:vertical; font-size:12px;"></textarea>
                 </div>
                 <div style="font-size: 11px; color: var(--success); margin-top: 8px;">订阅配置变更保存后立即生效</div>
@@ -817,7 +1001,7 @@
             </div>
 
             <div style="display: flex; justify-content: flex-end; gap: 12px; padding: 8px 0 24px;">
-              <button type="submit" class="btn btn-primary" style="padding: 10px 32px; font-size: 14px;">保存配置</button>
+              <button type="submit" class="btn btn-primary" id="settingsSaveBtn" disabled style="padding: 10px 32px; font-size: 14px;">保存配置</button>
             </div>
           </form>
         </div>
@@ -828,13 +1012,13 @@
 
   <!-- Modals -->
   <!-- Auth Modal -->
-  <div class="modal-overlay" id="loginOverlay">
+  <div class="modal-overlay" id="loginOverlay" role="dialog" aria-modal="true" aria-label="登录控制台">
     <div class="modal">
       <div class="modal-header">身份验证</div>
       <form onsubmit="handleLogin(event)">
         <div class="modal-body">
           <div class="form-group">
-            <label>系统密码</label>
+            <label for="password">系统密码</label>
             <input type="password" id="password" required placeholder="Enter password..." />
           </div>
           <div id="loginError" style="color: var(--error); font-size: 12px; display: none;"></div>
@@ -849,26 +1033,26 @@
   <!-- Settings Modal -->
   <!-- Node Edit Modal -->
   <div class="modal-overlay" id="nodeModalOverlay">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="nodeModalTitle">
       <div class="modal-header" id="nodeModalTitle">节点配置</div>
       <form onsubmit="handleNodeSubmit(event)">
         <div class="modal-body">
           <div class="form-group">
-            <label>节点名称 Name</label>
+            <label for="nodeName">节点名称 Name</label>
             <input type="text" id="nodeName" placeholder="HK-01" />
           </div>
           <div class="form-group">
-            <label>节点 URI</label>
+            <label for="nodeUri">节点 URI</label>
             <input type="text" id="nodeUri" required placeholder="vless://... 或 anytls://..." />
           </div>
           <div class="form-group">
-            <label>映射端口 (可选)</label>
+            <label for="nodePort">映射端口 (可选)</label>
             <input type="number" id="nodePort" placeholder="0" />
           </div>
           <input type="hidden" id="nodeEditName" />
         </div>
         <div class="modal-footer">
-          <button type="button" class="btn" onclick="document.getElementById('nodeModalOverlay').classList.remove('show')">取消</button>
+          <button type="button" class="btn" onclick="closeModal('nodeModalOverlay')">取消</button>
           <button type="submit" class="btn btn-primary" id="nodeSubmitBtn">保存</button>
         </div>
       </form>
@@ -877,11 +1061,11 @@
 
 
 
-  <div class="toast-container" id="toastContainer"></div>
+  <div class="toast-container" id="toastContainer" aria-live="polite" aria-atomic="false"></div>
 
   <!-- Full-screen Loading Overlay -->
   <div id="fullscreenLoading" style="display:none; position:fixed; inset:0; z-index:9999; background:rgba(0,0,0,0.5); backdrop-filter:blur(4px); display:none; align-items:center; justify-content:center;">
-    <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:32px 48px; text-align:center; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <div style="background:var(--bg-panel); border:1px solid var(--border); border-radius:12px; padding:32px 48px; text-align:center; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
       <div style="margin-bottom:16px;">
         <svg width="40" height="40" viewBox="0 0 40 40" style="animation:spin 1s linear infinite;">
           <circle cx="20" cy="20" r="16" fill="none" stroke="var(--border)" stroke-width="3"/>
@@ -906,15 +1090,26 @@
     let configNodes = [];
     let _savedSubSnapshot = '';
     let _savedCoreSnapshot = '';
+    let settingsLoaded = false;
+    let authReady = false;
+    let authEpoch = 0;
+    let pendingReloadAfterLogin = false;
+    let coreReloadPending = false;
+    const activeRequests = new Set();
+    let configRenderLimit = 300;
+    let debugRenderLimit = 300;
+    let debugSuccessRate = 0;
 
     function showFullscreenLoading(text, subtext) {
       document.getElementById('fullscreenLoadingText').textContent = text || '处理中...';
       document.getElementById('fullscreenLoadingSubtext').textContent = subtext || '';
       const el = document.getElementById('fullscreenLoading');
       el.style.display = 'flex';
+      document.getElementById('mainContent').inert = true;
     }
     function hideFullscreenLoading() {
       document.getElementById('fullscreenLoading').style.display = 'none';
+      document.getElementById('mainContent').inert = false;
     }
 
     // Chart instances
@@ -924,6 +1119,9 @@
     let failureChartInst = null;
     let trafficChartInst = null;
     let trafficSource = null;
+    let trafficRetryTimer = null;
+    let trafficGeneration = 0;
+    let trafficRetryDelay = 1000;
     let trafficDataUp = [];
     let trafficDataDown = [];
     let trafficTime = [];
@@ -937,7 +1135,6 @@
       trafficChartInst && trafficChartInst.resize();
     });
 
-    const EMOJIS = { jp: '🇯🇵', kr: '🇰🇷', us: '🇺🇸', hk: '🇭🇰', tw: '🇹🇼', sg: '🇸🇬', other: '🌍' };
 
     function showToast(msg, type='success') {
       const c = document.getElementById('toastContainer');
@@ -947,53 +1144,183 @@
       setTimeout(() => { t.style.opacity=0; setTimeout(()=>t.remove(),300); }, 3000);
     }
 
-    async function checkAuth() {
+    function invalidateAuth() {
+      authReady = false; authEpoch++;
+      clearGeneratedLink(); stopAutoRefresh(); stopLogPolling(); stopTrafficSSE();
+      for (const controller of activeRequests) controller.abort();
+      activeRequests.clear();
+    }
+    async function apiFetch(path, options = {}) {
+      // Reload and subscription writes legitimately include health checks and
+      // draining old cores. They get a longer finite deadline than snapshots.
+      const slowOperation=options.method && options.method!=='GET' && (path.startsWith('/api/subscription/') || path==='/api/reload');
+      const { timeoutMs = slowOperation ? 300000 : 15000, ...requestOptions } = options;
+      const controller = new AbortController();
+      const externalSignal = requestOptions.signal;
+      const abort = () => controller.abort();
+      if (externalSignal?.aborted) controller.abort();
+      else externalSignal?.addEventListener('abort',abort,{once:true});
+      activeRequests.add(controller);
+      const timer = timeoutMs > 0 ? setTimeout(abort,timeoutMs) : null;
+      const finish = () => {
+        if (timer !== null) clearTimeout(timer);
+        activeRequests.delete(controller);
+        externalSignal?.removeEventListener('abort',abort);
+      };
       try {
-        const res = await fetch('/api/nodes');
-        if (res.status === 401) { document.getElementById('loginOverlay').classList.add('show'); return false; }
-        return true;
-      } catch (e) { return false; }
+        const response = await fetch(path, {cache:'no-store', ...requestOptions,signal:controller.signal});
+        if (!response.ok) {
+          let message = `请求失败（HTTP ${response.status}）`;
+          try { const detail = await response.json(); message = detail.error || detail.message || message; } catch (_) {}
+          if (response.status === 401) { invalidateAuth(); showModal('loginOverlay'); }
+          throw new Error(message);
+        }
+        // Finite APIs include body reads in the deadline; probe-all is a
+        // long-lived stream and explicitly opts out with timeoutMs: 0.
+        if (timeoutMs === 0 && response.body) {
+          const reader=response.body.getReader();
+          const stream=new ReadableStream({
+            async pull(target) {
+              try { const result=await reader.read(); if(result.done) { finish(); target.close(); } else target.enqueue(result.value); }
+              catch(error) { finish(); target.error(error); }
+            },
+            cancel(reason) { controller.abort(); finish(); return reader.cancel(reason); }
+          });
+          return new Response(stream,{status:response.status,statusText:response.statusText,headers:response.headers});
+        }
+        if (timeoutMs === 0) { finish(); return response; }
+        const body=await response.arrayBuffer();
+        finish();
+        return new Response(body,{status:response.status,statusText:response.statusText,headers:response.headers});
+      } catch (error) {
+        finish();
+        if (controller.signal.aborted) throw new Error('请求已取消或超时，请检查连接后重试');
+        throw error;
+      }
+    }
+    async function requestJSON(path, options = {}) { return (await apiFetch(path,options)).json(); }
+    async function refreshAuthStatus() {
+      const status = await requestJSON('/api/auth');
+      document.getElementById('logoutBtn').hidden = !!status.no_password;
+      return status;
+    }
+    function clearLogoutData() {
+      configNodes=[]; allNodesCache=[]; proxySessions=[]; window._debugNodes=[];
+      _savedCoreSnapshot=''; _savedSubSnapshot=''; settingsLoaded=false;
+      document.querySelectorAll('#settingsTab input[type="password"], #settingsTab textarea, #nodeUri').forEach(field=>field.value='');
+      document.getElementById('settingsSaveBtn').disabled=true;
+      document.getElementById('configNodesTableBody').innerHTML='';
+      document.getElementById('debugNodesTableBody').innerHTML='';
+      document.getElementById('nodesTableBody').innerHTML='';
+      document.getElementById('proxySessionsBody').innerHTML='';
+      pendingReloadAfterLogin=false;
+    }
+    async function logout() {
+      try {
+        await requestJSON('/api/auth',{method:'DELETE'});
+        invalidateAuth(); clearLogoutData(); document.getElementById('password').value='';
+        showModal('loginOverlay'); showToast('已退出登录');
+      } catch (error) { showToast(error.message,'error'); }
     }
 
+    function toggleSidebar(open) {
+      const next = typeof open === 'boolean' ? open : !document.body.classList.contains('nav-open');
+      document.body.classList.toggle('nav-open',next);
+      document.getElementById('sidebarBackdrop').hidden = !next;
+      document.getElementById('mobileMenuBtn').setAttribute('aria-expanded',String(next));
+      document.getElementById('mobileMenuBtn').setAttribute('aria-label',next ? '关闭导航菜单' : '打开导航菜单');
+      if (next) document.querySelector('.nav-item.active').focus();
+    }
+    let modalReturnFocus = null;
+    function showModal(id) {
+      const overlay = document.getElementById(id);
+      if (!overlay.classList.contains('show')) modalReturnFocus = document.activeElement;
+      overlay.classList.add('show');
+      document.getElementById('mainContent').inert=true;
+      setTimeout(() => overlay.querySelector('input:not([type="hidden"]), button')?.focus(),0);
+    }
+    function closeModal(id) {
+      document.getElementById(id).classList.remove('show');
+      if(!document.querySelector('.modal-overlay.show') && document.getElementById('fullscreenLoading').style.display!=='flex') document.getElementById('mainContent').inert=false;
+      if (modalReturnFocus && document.contains(modalReturnFocus)) modalReturnFocus.focus();
+    }
+    document.addEventListener('keydown',e => {
+      if (e.key === 'Escape') {
+        if (document.getElementById('nodeModalOverlay').classList.contains('show')) closeModal('nodeModalOverlay');
+        if (document.body.classList.contains('nav-open')) { toggleSidebar(false); document.getElementById('mobileMenuBtn').focus(); }
+      }
+      if (e.key !== 'Tab') return;
+      const focusRoot = document.querySelector('.modal-overlay.show') || (document.body.classList.contains('nav-open') ? document.getElementById('sidebar') : null);
+      if (!focusRoot) return;
+      const items = [...focusRoot.querySelectorAll('button:not([disabled]), input:not([type="hidden"]), select, textarea, a[href]')].filter(el => el.getClientRects().length);
+      if (!items.length) return;
+      const first = items[0],last = items[items.length-1];
+      if (e.shiftKey && (document.activeElement === first || !focusRoot.contains(document.activeElement))) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (document.activeElement === last || !focusRoot.contains(document.activeElement))) { e.preventDefault(); first.focus(); }
+    });
+
+    async function checkAuth() {
+      try { const status=await refreshAuthStatus(); if(!status.authenticated) { invalidateAuth(); showModal('loginOverlay'); return false; } authReady=true; return true; }
+      catch (e) {
+        document.getElementById('lastUpdate').textContent='连接未就绪';
+        document.getElementById('connectionStatus').classList.add('stale');
+        if (!document.getElementById('loginOverlay').classList.contains('show')) {
+          const error = document.getElementById('globalError');
+          error.textContent = e.message + '。请检查服务连接或点击刷新重试。'; error.hidden = false;
+        }
+        return false;
+      }
+    }
     async function handleLogin(e) {
       e.preventDefault();
-      const pwd = document.getElementById('password').value;
-      const err = document.getElementById('loginError');
+      const button=e.target.querySelector('button[type="submit"]'), error=document.getElementById('loginError');
+      error.style.display='none'; button.disabled=true;
       try {
-        const res = await fetch('/api/auth', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password:pwd})});
-        if (res.ok) { document.getElementById('loginOverlay').classList.remove('show'); refresh(); }
-        else { err.textContent = 'Auth Failed'; err.style.display = 'block'; }
-      } catch (ex) { err.textContent = ex.message; err.style.display = 'block'; }
+        await requestJSON('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});
+        closeModal('loginOverlay'); document.getElementById('password').value='';
+        await refreshAuthStatus(); authReady=true;
+        refresh(); if (isAutoRefresh) startAutoRefresh(); syncLiveResources();
+        if (document.getElementById('sessionsTab').classList.contains('active')) loadProxySessions();
+        if(document.getElementById('settingsTab').classList.contains('active') && !settingsLoaded) loadSettingsPage();
+        if (pendingReloadAfterLogin) {
+          showToast('已登录。管理密码已生效，其余设置请点击「重载核心」应用；未保存的订阅更改仍保留。');
+          pendingReloadAfterLogin=false;
+        }
+      } catch (ex) { error.textContent=ex.message; error.style.display='block'; }
+      finally { button.disabled=false; }
     }
-
+    const PAGE_TITLES={dashboard:'监控看板',sessions:'会话路由',manage:'节点配置',debug:'诊断分析',logs:'控制台日志',settings:'系统设置'};
     function switchTab(name) {
+      if (!PAGE_TITLES[name]) return;
       document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.nav-item').forEach(el => { el.classList.remove('active'); el.removeAttribute('aria-current'); });
       document.getElementById(`${name}Tab`).classList.add('active');
-      document.querySelector(`.nav-item[onclick="switchTab('${name}')"]`).classList.add('active');
-      if (name === 'dashboard') {
-        setTimeout(updateDashboardCharts, 100);
-      }
+      const nav=document.querySelector(`.nav-item[aria-controls="${name}Tab"]`);
+      nav.classList.add('active'); nav.setAttribute('aria-current','page');
+      document.getElementById('pageTitle').textContent=PAGE_TITLES[name];
+      toggleSidebar(false); document.getElementById('mainContent').focus({preventScroll:true});
+      if (name !== 'sessions') clearGeneratedLink();
+      if (name === 'dashboard') setTimeout(updateDashboardCharts,100);
+      if (name === 'sessions') loadProxySessions();
       if (name === 'manage') loadConfigNodes();
-      if (name === 'debug') {
-        loadDebugData();
-        setTimeout(updateDebugCharts, 100);
-      }
-      if (name === 'logs') {
-        startLogPolling();
-      } else {
-        stopLogPolling();
-      }
+      if (name === 'debug') loadDebugData();
+      syncLiveResources();
       if (name === 'settings') loadSettingsPage();
     }
-
     function toggleAutoRefresh() {
-      isAutoRefresh = !isAutoRefresh;
-      document.getElementById('autoRefreshBtn').textContent = isAutoRefresh ? '⏹ 关闭自动刷新' : '▶ 开启自动刷新';
+      isAutoRefresh=!isAutoRefresh;
+      document.getElementById('autoRefreshBtn').textContent=isAutoRefresh ? '自动刷新 · 开' : '自动刷新 · 暂停';
       if(isAutoRefresh) startAutoRefresh(); else stopAutoRefresh();
     }
-    function startAutoRefresh() { if(!autoRefreshInterval) autoRefreshInterval = setInterval(()=> { if(!document.hidden && document.getElementById('dashboardTab').classList.contains('active')) refresh(); }, 10000); }
-    function stopAutoRefresh() { clearInterval(autoRefreshInterval); autoRefreshInterval = null; }
+    function startAutoRefresh() {
+      if(!authReady) return;
+      if(!autoRefreshInterval) autoRefreshInterval=setInterval(() => {
+        if(document.hidden || !authReady) return;
+        if(document.getElementById('dashboardTab').classList.contains('active')) refresh();
+        if(document.getElementById('sessionsTab').classList.contains('active')) loadProxySessions();
+      },10000);
+    }
+    function stopAutoRefresh() { clearInterval(autoRefreshInterval); autoRefreshInterval=null; }
 
     function getQualityWidth(ms) {
       if(ms < 0) return 0; if(ms > 1000) return 100;
@@ -1007,8 +1334,9 @@
       return 'var(--error)';
     }
     function formatTime(ts) {
-      if(tsc || ts==='0001-01-01T00:00:00Z') return '-';
-      return new Date(ts).toLocaleTimeString();
+      if (!ts || ts==='0001-01-01T00:00:00Z') return '—';
+      const date=new Date(ts);
+      return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
     }
 
     function escapeHtml(text) {
@@ -1038,18 +1366,26 @@
         .replace(/"/g,'&quot;');
     }
 
+    let refreshingNodes=false;
     async function refresh() {
+      if(refreshingNodes) return;
+      refreshingNodes=true;
+      const epoch=authEpoch;
       try {
-        const res = await fetch('/api/nodes');
-        if (res.status === 401) { document.getElementById('loginOverlay').classList.add('show'); stopAutoRefresh(); return; }
-        const data = await res.json();
-        allNodesCache = data.nodes || [];
-        updateDashboardStats(data);
-        filterByRegion(currentRegionFilter);
-        document.getElementById('lastUpdate').textContent = `Sync: ${new Date().toLocaleTimeString()}`;
-        updateSweepProgress(data.probe_sweep);
-        fetchSubscriptionStatus();
-      } catch(e) {}
+        const data=await requestJSON('/api/nodes');
+        if(epoch!==authEpoch || !authReady) return;
+        allNodesCache=data.nodes || [];
+        updateDashboardStats(data); applyNodeFilters();
+        document.getElementById('lastUpdate').textContent=`已同步 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
+        document.getElementById('connectionStatus').classList.remove('stale');
+        document.getElementById('globalError').hidden=true;
+        updateSweepProgress(data.probe_sweep); fetchSubscriptionStatus();
+      } catch(e) {
+        document.getElementById('lastUpdate').textContent='连接异常 · 数据可能已过期';
+        document.getElementById('connectionStatus').classList.add('stale');
+        const error=document.getElementById('globalError');
+        error.textContent=e.message+'。已保留上次数据，请刷新重试。'; error.hidden=false;
+      } finally { refreshingNodes=false; }
     }
 
     // updateSweepProgress reflects the backend initial/periodic health-check
@@ -1087,7 +1423,7 @@
 
     function initEchart(id) {
       const el = document.getElementById(id);
-      if(!el) return null;
+      if(!el || typeof echarts === 'undefined') return null;
       let chart = echarts.getInstanceByDom(el);
       if(!chart) chart = echarts.init(el, null, { renderer: 'canvas' });
       return chart;
@@ -1096,10 +1432,16 @@
     function getCssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
     function updateDashboardCharts() {
+      if (typeof echarts === 'undefined') {
+        document.querySelectorAll('.chart-container').forEach(el => {
+          el.textContent = '图表资源未加载，节点表与实时速率仍可使用。';
+          el.style.cssText = 'padding-top:70px;color:var(--text-muted);font-size:12px;line-height:1.8;';
+        });
+        connectTrafficSSE(); return;
+      }
       if(!regionChartInst) regionChartInst = initEchart('regionChart');
       if(!latencyChartInst) latencyChartInst = initEchart('latencyChart');
 
-      if (!allNodesCache || allNodesCache.length === 0) return;
 
       // 1. Region Chart Data
       const regionStats = {};
@@ -1124,7 +1466,7 @@
           backgroundColor: getCssVar('--bg-panel'), borderColor: getCssVar('--border'), textStyle: { color: getCssVar('--text-main') },
           formatter: (params) => {
              const stat = regionStats[params.name];
-             return `${params.name} Region<br/>Total Node: ${stat.total}<br/>Available: ${stat.healthy}`;
+             return `${escapeHtml(params.name)} Region<br/>Total Node: ${stat.total}<br/>Available: ${stat.healthy}`;
           }
         },
         legend: { top: 'bottom', textStyle: { color: getCssVar('--text-muted') } },
@@ -1138,7 +1480,7 @@
       });
 
       // 2. Latency Chart Data
-      const sorted = allNodesCache.filter(n => n.last_latency_ms > 0 && !n.blacklisted).sort((a,b) => a.last_latency_ms - b.last_latency_ms).slice(0, 10);
+      const sorted = allNodesCache.filter(n => n.last_latency_ms > 0 && nodeStatus(n) === 'healthy').sort((a,b) => a.last_latency_ms - b.last_latency_ms).slice(0, 10);
       const latencyX = sorted.map(n => n.name || n.tag);
       const latencyY = sorted.map(n => n.last_latency_ms);
 
@@ -1179,8 +1521,8 @@
             { name: 'Down', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2, color: '#10b981' }, areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{offset: 0, color: 'rgba(16,185,129,0.5)'}, {offset: 1, color: 'rgba(16,185,129,0)'}]) }, data: trafficDataDown }
           ]
         });
-        connectTrafficSSE(); // connect SSE on init
       }
+      connectTrafficSSE();
     }
 
     function formatBytes(bytes, decimals = 2) {
@@ -1195,62 +1537,108 @@
       return parseFloat((bytes / Math.pow(k, safeI)).toFixed(dm)) + ' ' + sizes[safeI];
     }
 
+    function trafficWanted() {
+      return authReady && !document.hidden && document.getElementById('dashboardTab').classList.contains('active');
+    }
+    function stopTrafficSSE() {
+      trafficGeneration++;
+      if (trafficRetryTimer !== null) clearTimeout(trafficRetryTimer);
+      trafficRetryTimer = null;
+      if (trafficSource) trafficSource.close();
+      trafficSource = null;
+    }
     function connectTrafficSSE() {
-      if (trafficSource) return;
-      trafficSource = new EventSource('/api/traffic');
-      trafficSource.onmessage = function(e) {
+      if (!trafficWanted() || trafficSource || trafficRetryTimer !== null) return;
+      const generation = ++trafficGeneration;
+      const source = new EventSource('/api/traffic'); trafficSource = source;
+      document.getElementById('trafficStatus').textContent='连接中…';
+      source.onmessage = function(event) {
+        if (generation !== trafficGeneration || !trafficWanted()) return;
         try {
-          const d = JSON.parse(e.data);
-          const up = d.up || 0;
-          const down = d.down || 0;
-          const now = new Date().toLocaleTimeString([], {hour12: false});
-          trafficTime.push(now);
-          trafficDataUp.push(up);
-          trafficDataDown.push(down);
-          
+          const data = JSON.parse(event.data);
+          const up = Number(data.up) || 0, down = Number(data.down) || 0;
+          trafficRetryDelay=1000;
+          document.getElementById('trafficStatus').textContent='实时';
+          trafficTime.push(new Date().toLocaleTimeString([], {hour12:false})); trafficDataUp.push(up); trafficDataDown.push(down);
           if (trafficTime.length > 60) { trafficTime.shift(); trafficDataUp.shift(); trafficDataDown.shift(); }
-          
-          // Update live speed stat panels
-          document.getElementById('liveUpSpeed').textContent = formatBytes(up) + '/s';
-          document.getElementById('liveDownSpeed').textContent = formatBytes(down) + '/s';
-          
-          if(trafficChartInst) {
-            trafficChartInst.setOption({ xAxis: { data: trafficTime }, series: [{ data: trafficDataUp }, { data: trafficDataDown }] });
-          }
-        } catch(err){}
+          document.getElementById('liveUpSpeed').textContent=formatBytes(up)+'/s';
+          document.getElementById('liveDownSpeed').textContent=formatBytes(down)+'/s';
+          if (trafficChartInst) trafficChartInst.setOption({xAxis:{data:trafficTime},series:[{data:trafficDataUp},{data:trafficDataDown}]});
+        } catch (_) {}
       };
-      trafficSource.onerror = function() {
-        trafficSource.close();
-        trafficSource = null;
-        setTimeout(connectTrafficSSE, 5000);
+      source.onerror = function() {
+        if (generation !== trafficGeneration) return;
+        source.close(); trafficSource=null;
+        document.getElementById('trafficStatus').textContent='统计未就绪 · 自动重试';
+        if (!trafficWanted()) return;
+        const delay=trafficRetryDelay; trafficRetryDelay=Math.min(30000,trafficRetryDelay*2);
+        trafficRetryTimer=setTimeout(async () => {
+          trafficRetryTimer=null;
+          if (generation !== trafficGeneration || !trafficWanted()) return;
+          // EventSource hides the HTTP status. Verify auth before re-opening to
+          // stop retrying forever when a management session expires.
+          try { const status=await refreshAuthStatus(); if(!status.authenticated) { invalidateAuth(); showModal('loginOverlay'); return; } }
+          catch (_) { if (!authReady || generation !== trafficGeneration) return; }
+          if (generation === trafficGeneration) connectTrafficSSE();
+        },delay);
       };
     }
+    function syncLiveResources() {
+      if (trafficWanted()) connectTrafficSSE(); else stopTrafficSSE();
+      if (authReady && !document.hidden && document.getElementById('logsTab').classList.contains('active')) startLogPolling(); else stopLogPolling();
+    }
+    document.addEventListener('visibilitychange', () => {
+      syncLiveResources();
+      if (!document.hidden && authReady && isAutoRefresh) {
+        if (document.getElementById('dashboardTab').classList.contains('active')) refresh();
+        if (document.getElementById('sessionsTab').classList.contains('active')) loadProxySessions();
+      }
+    });
+    window.addEventListener('pagehide', () => { stopAutoRefresh(); stopLogPolling(); stopTrafficSSE(); for(const controller of activeRequests) controller.abort(); });
+    window.addEventListener('pageshow', () => { if(authReady) { if(isAutoRefresh) startAutoRefresh(); syncLiveResources(); } });
 
+    function nodeStatus(n) {
+      if(n.blacklisted) return 'blacklisted';
+      if(!n.initial_check_done) return 'pending';
+      return n.available ? 'healthy' : 'unavailable';
+    }
     function filterByRegion(region) {
-      currentRegionFilter = region;
-      document.querySelectorAll('.region-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.region === region));
-      const flt = region === 'all' ? allNodesCache : allNodesCache.filter(n => (n.region||'other') === region);
-      renderNodes(flt);
+      currentRegionFilter=region;
+      document.querySelectorAll('.region-btn').forEach(btn => { btn.classList.toggle('active',btn.dataset.region === region); btn.setAttribute('aria-pressed',String(btn.dataset.region === region)); });
+      applyNodeFilters(true);
+    }
+    function applyNodeFilters(resetLimit=false) {
+      if(resetLimit) nodeRenderLimit=300;
+      const query=document.getElementById('nodeSearch').value.trim().toLowerCase(),status=document.getElementById('nodeStatusFilter').value;
+      const nodes=allNodesCache.filter(n => (currentRegionFilter === 'all' || (n.region||'other') === currentRegionFilter) && (status === 'all' || nodeStatus(n) === status) && (!query || [n.name,n.tag,n.region,n.country].some(v => String(v || '').toLowerCase().includes(query))));
+      const sort=document.getElementById('nodeSort').value;
+      if (sort === 'latency') nodes.sort((a,b) => (nodeStatus(a)==='healthy' ? (a.last_latency_ms>=0 ? a.last_latency_ms : Infinity) : Infinity)-(nodeStatus(b)==='healthy' ? (b.last_latency_ms>=0 ? b.last_latency_ms : Infinity) : Infinity));
+      else if (sort === 'connections') nodes.sort((a,b) => (b.active_connections||0)-(a.active_connections||0));
+      else if (sort === 'failures') nodes.sort((a,b) => (b.failure_count||0)-(a.failure_count||0));
+      else if (sort === 'name') nodes.sort((a,b) => String(a.name||a.tag).localeCompare(String(b.name||b.tag),'zh-CN'));
+      document.getElementById('nodeFilterCount').textContent=`${nodes.length.toLocaleString()} / ${allNodesCache.length.toLocaleString()} 个节点`;
+      renderNodes(nodes);
     }
 
     function renderNodes(nodes) {
       const tbody = document.getElementById('nodesTableBody');
       const hint = document.getElementById('nodesPagingHint');
-      if (!nodes.length) { tbody.innerHTML = ''; document.getElementById('emptyState').style.display='block'; if(hint) hint.style.display='none'; return;}
+      if (!nodes.length) { tbody.innerHTML = ''; const empty=document.getElementById('emptyState'); empty.textContent=allNodesCache.length ? '没有匹配的节点，请调整搜索或筛选条件。' : '暂无节点，请添加节点或配置订阅。'; empty.style.display='block'; if(hint) hint.style.display='none'; return;}
       document.getElementById('emptyState').style.display='none';
       // 分批渲染：节点量大时只渲染前 nodeRenderLimit 个，避免一次性插入数千行 DOM 导致卡顿。
       const visible = nodes.slice(0, nodeRenderLimit);
       tbody.innerHTML = visible.map(n => {
-        const ms = n.last_latency_ms || -1;
+        const ms = Number.isFinite(n.last_latency_ms) ? n.last_latency_ms : -1;
         let badge = '', statusText = '';
-        if (n.blacklisted) { badge = 'badge-error'; statusText = '拉黑 Blocked'; }
-        else if (ms < 0) { badge = 'badge-offline'; statusText = '未测试 Unknown'; }
-        else if (n.failure_count >= 1) { badge = 'badge-error'; statusText = '异常 Error'; }
-        else { badge = 'badge-healthy'; statusText = '在线 Healthy'; }
+        const status=nodeStatus(n);
+        if(status === 'blacklisted') { badge='badge-error'; statusText='已拉黑'; }
+        else if(status === 'pending') { badge='badge-offline'; statusText='等待检查'; }
+        else if(status === 'unavailable') { badge='badge-error'; statusText='不可用'; }
+        else { badge='badge-healthy'; statusText='健康在线'; }
 
         return `<tr>
-          <td><span class="badge ${badge}">${statusText}</span></td>
-          <td>${EMOJIS[n.region||'other']} ${(n.region||'other').toUpperCase()}</td>
+          <td><span class="badge ${badge}" title="${escapeHtml(n.last_error || statusText)}">${statusText}</span></td>
+          <td>${escapeHtml((n.region||'other').toUpperCase())}</td>
           <td>
             <div class="cell-trunc" style="font-weight: 500" title="${escapeHtml(n.name || n.tag)}">${escapeHtml(n.name || n.tag)}</div>
             <div class="cell-trunc" style="font-size: 11px; color: var(--text-muted)" title="${escapeHtml(n.tag)}">${escapeHtml(n.tag)}</div>
@@ -1283,32 +1671,30 @@
 
     function showMoreNodes() {
       nodeRenderLimit += 300;
-      filterByRegion(currentRegionFilter);
+      applyNodeFilters();
     }
 
     async function probeNode(tag) {
       showToast('探测中...');
       try {
-        const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/probe', {method:'POST'});
+        const r = await apiFetch('/api/nodes/'+encodeURIComponent(tag)+'/probe', {method:'POST'});
         const d = await r.json();
         if(d.error) showToast(d.error, 'error'); else { showToast(`Latency: ${d.latency_ms}ms`); refresh(); }
       } catch(e) { showToast(e.message, 'error'); }
     }
     
     async function releaseNode(tag) {
-      try {
-        const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/release', {method:'POST'});
-        showToast('已解封'); refresh();
-      } catch(e) { }
+      try { await requestJSON('/api/nodes/'+encodeURIComponent(tag)+'/release',{method:'POST'}); showToast('节点已解封'); refresh(); }
+      catch(e) { showToast(e.message,'error'); }
     }
 
     async function blacklistNode(tag) {
       if(!confirm('确定拉黑该节点 24 小时？')) return;
       try {
-        const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/blacklist', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({duration:'24h'})});
+        const r = await apiFetch('/api/nodes/'+encodeURIComponent(tag)+'/blacklist', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({duration:'24h'})});
         const d = await r.json();
         if(d.error) showToast(d.error, 'error'); else { showToast(d.message); refresh(); }
-      } catch(e) { showToast('拉黑失败', 'error'); }
+      } catch(e) { showToast('拉黑失败：' + e.message, 'error'); }
     }
 
     // Probe All
@@ -1318,11 +1704,13 @@
       document.getElementById('probeProgress').classList.add('show');
       document.getElementById('probeProgressFill').style.width = '0%';
       let total = 0, current = 0, suc = 0, fail = 0;
+      let probeError=false;
       try {
-        const res = await fetch('/api/nodes/probe-all', { method: 'POST' });
+        const res = await apiFetch('/api/nodes/probe-all', { method: 'POST', timeoutMs: 0 });
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buf = '';
+        let streamError=null;
         while(true) {
           const {done, value} = await reader.read();
           if(done) break;
@@ -1341,23 +1729,27 @@
                    document.getElementById('probeStats').textContent = `${current}/${total}`;
                    document.getElementById('probeSuccess').textContent = suc;
                    document.getElementById('probeFail').textContent = fail;
+                 } else if (d.type === 'error') {
+                   streamError=new Error(d.message || d.error || '批量探测未启动，请稍后重试');
                  } else if (d.type === 'complete') {
                    showToast(`探测完成: 成功${d.success}, 失败${d.failed}`);
                  }
-               } catch(e){}
+               } catch(e){ showToast(e.message || '请求失败，请重试','error'); }
             }
           }
+          if(streamError) { await reader.cancel(streamError.message); throw streamError; }
         }
-      } catch(e){}
+      } catch(e){ probeError=true; showToast(e.message || '请求失败，请重试','error'); }
       finally {
         isProbing = false;
-        setTimeout(()=>{ document.getElementById('probeProgress').classList.remove('show'); refresh(); }, 2000);
+        if(probeError) { document.getElementById('probeProgress').classList.remove('show'); refresh(); }
+        else setTimeout(()=>{ document.getElementById('probeProgress').classList.remove('show'); refresh(); }, 2000);
       }
     }
 
     async function exportNodes(all=false) {
       try {
-        const res = await fetch(all ? '/api/export?all=true' : '/api/export');
+        const res = await apiFetch(all ? '/api/export?all=true' : '/api/export');
         if(!res.ok) throw new Error();
         const blob = await res.blob();
         const url = window.URL.createObjectURL(blob);
@@ -1369,7 +1761,7 @@
     // Subscriptions
     async function fetchSubscriptionStatus() {
       try {
-        const res = await fetch('/api/subscription/status');
+        const res = await apiFetch('/api/subscription/status');
         if(!res.ok) return;
         const d = await res.json();
         const btn = document.getElementById('refreshSubBtn');
@@ -1377,15 +1769,15 @@
         btn.style.display='inline-flex';
         document.getElementById('subscriptionStatus').textContent = `[Sub: ${d.node_count}]`;
         document.getElementById('subscriptionTrend').textContent = d.is_refreshing ? 'Syncing...' : (d.last_error ? 'ERR' : 'OK');
-      } catch(e){}
+      } catch(e){ showToast(e.message || '请求失败，请重试','error'); }
     }
     
     async function refreshSubscription() {
       try {
-        const s = await fetch('/api/subscription/status').then(r=>r.json());
+        const s = await apiFetch('/api/subscription/status').then(r=>r.json());
         if(s.nodes_modified && !confirm('本地节点已修改，刷新将覆盖，继续？')) return;
         showToast('开始刷新订阅...');
-        const r = await fetch('/api/subscription/refresh', {method:'POST'});
+        const r = await apiFetch('/api/subscription/refresh', {method:'POST'});
         const res = await r.json();
         if(res.error) showToast(res.error, 'error'); else { showToast(`成功获取 ${res.node_count} 节点`); refresh(); }
       } catch(e) { showToast('失败'+e, 'error'); }
@@ -1394,32 +1786,48 @@
     // Manage Nodes
     async function loadConfigNodes() {
       try {
-        const res = await fetch('/api/nodes/config');
+        const epoch=authEpoch;
+        const res = await apiFetch('/api/nodes/config');
         const data = await res.json();
+        if(epoch!==authEpoch || !authReady) return;
         configNodes = data.nodes || [];
-        const tbody = document.getElementById('configNodesTableBody');
-        tbody.innerHTML = configNodes.map((n, i) => `
+        renderConfigNodes();
+        document.getElementById('subscriptionWarning').style.display = configNodes.some(n=>n.source==='subscription') ? 'block' : 'none';
+      } catch(e){ showToast(e.message || '请求失败，请重试','error'); }
+    }
+    function renderPaging(id, total, visible, action) {
+      const el=document.getElementById(id); el.hidden=total<=visible;
+      el.innerHTML=`显示 ${visible.toLocaleString()} / ${total.toLocaleString()} 个节点 <button type="button" class="btn btn-sm" onclick="${action}()">显示更多 (+${Math.min(300,total-visible)})</button>`;
+    }
+    function renderConfigNodes(resetLimit=false) {
+      if(resetLimit) configRenderLimit=300;
+      const query=document.getElementById('configNodeSearch').value.trim().toLowerCase();
+      const filtered=configNodes.filter(n => !query || [n.name,n.uri,n.source].some(v=>String(v||'').toLowerCase().includes(query)));
+      const visible=filtered.slice(0,configRenderLimit);
+      document.getElementById('configFilterCount').textContent=`${filtered.length.toLocaleString()} / ${configNodes.length.toLocaleString()} 个节点`;
+      document.getElementById('configNodesEmpty').hidden=filtered.length>0;
+      document.getElementById('configNodesTableBody').innerHTML = visible.map(n => `
           <tr>
             <td><strong class="cell-trunc" style="display:inline-block;vertical-align:bottom" title="${escapeHtml(n.name)}">${escapeHtml(n.name)}</strong></td>
             <td class="tt-mono cell-trunc cell-trunc-uri" title="${escapeHtml(n.uri)}">${escapeHtml(n.uri)}</td>
             <td class="tt-mono">${n.port || '-'}</td>
-            <td><span class="badge ${n.source==='subscription'?'badge-warning':'badge-healthy'}">${n.source||'manual'}</span></td>
+            <td><span class="badge ${n.source==='subscription'?'badge-warning':'badge-healthy'}">${escapeHtml(n.source||'manual')}</span></td>
             <td>
               <button class="btn btn-sm" onclick="showEditNodeModal('${escapeAttrJs(n.name)}')">编辑</button>
               <button class="btn btn-sm btn-danger" onclick="deleteNode('${escapeAttrJs(n.name)}')">删除</button>
             </td>
           </tr>
         `).join('');
-        document.getElementById('subscriptionWarning').style.display = configNodes.some(n=>n.source==='subscription') ? 'block' : 'none';
-      } catch(e){}
+      renderPaging('configNodesPaging',filtered.length,visible.length,'showMoreConfigNodes');
     }
+    function showMoreConfigNodes() { configRenderLimit+=300; renderConfigNodes(); }
 
-    function showAddNodeModal() { isEditMode=false; document.getElementById('nodeModalTitle').textContent='添加节点'; document.getElementById('nodeName').value=''; document.getElementById('nodeUri').value=''; document.getElementById('nodePort').value=''; document.getElementById('nodeModalOverlay').classList.add('show');}
+    function showAddNodeModal() { isEditMode=false; document.getElementById('nodeModalTitle').textContent='添加节点'; document.getElementById('nodeName').value=''; document.getElementById('nodeUri').value=''; document.getElementById('nodePort').value=''; showModal('nodeModalOverlay');}
     function showEditNodeModal(name) { 
       const n = configNodes.find(x=>x.name===name); if(!n) return;
       isEditMode=true; document.getElementById('nodeModalTitle').textContent='编辑节点';
       document.getElementById('nodeName').value=n.name; document.getElementById('nodeUri').value=n.uri; document.getElementById('nodePort').value=n.port||''; document.getElementById('nodeEditName').value=n.name;
-      document.getElementById('nodeModalOverlay').classList.add('show');
+      showModal('nodeModalOverlay');
     }
     async function handleNodeSubmit(e) {
       e.preventDefault();
@@ -1428,35 +1836,47 @@
         const editName = document.getElementById('nodeEditName').value;
         const url = isEditMode ? '/api/nodes/config/'+encodeURIComponent(editName) : '/api/nodes/config';
         const method = isEditMode ? 'PUT' : 'POST';
-        const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
-        if(r.ok) { document.getElementById('nodeModalOverlay').classList.remove('show'); showToast('成功'); loadConfigNodes(); } else { const d = await r.json(); showToast(d.error, 'error'); }
-      } catch(e){}
+        const r = await apiFetch(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
+        if(r.ok) { closeModal('nodeModalOverlay'); showToast('成功'); loadConfigNodes(); } else { const d = await r.json(); showToast(d.error, 'error'); }
+      } catch(e){ showToast(e.message || '请求失败，请重试','error'); }
     }
     async function deleteNode(name) {
-      if(!confirm('Delete '+name+'?')) return;
+      if(!confirm(`确定删除节点 ${name}？修改后请重载核心生效。`)) return;
       try {
-        const r = await fetch('/api/nodes/config/'+encodeURIComponent(name), {method:'DELETE'});
+        const r = await apiFetch('/api/nodes/config/'+encodeURIComponent(name), {method:'DELETE'});
         if(r.ok) { showToast('删除成功'); loadConfigNodes(); }
-      } catch(e){}
+      } catch(e){ showToast(e.message || '请求失败，请重试','error'); }
     }
     async function triggerReload() {
       if(!confirm('重载核心将中断连接，确认？')) return;
-      try { const r = await fetch('/api/reload', {method:'POST'}); if(r.ok) {showToast('重载成功'); refresh();} } catch(e){}
+      try { const r = await apiFetch('/api/reload', {method:'POST'}); if(r.ok) {coreReloadPending=false; document.getElementById('savedSettingsPending').hidden=true; showToast('重载成功'); refresh();} } catch(e){ showToast(e.message || '请求失败，请重试','error'); }
     }
 
     // Debug
     async function loadDebugData() {
       try {
-        const res = await fetch('/api/debug');
+        const epoch=authEpoch;
+        const res = await apiFetch('/api/debug');
         const d = await res.json();
+        if(epoch!==authEpoch || !authReady) return;
         document.getElementById('debugTotalCalls').textContent = d.total_calls||0;
         document.getElementById('debugTotalSuccess').textContent = d.total_success||0;
         document.getElementById('debugSuccessRate').textContent = (d.success_rate||0).toFixed(1)+'%';
-        const tb = document.getElementById('debugNodesTableBody');
-        tb.innerHTML = (d.nodes||[]).map(n => {
+        window._debugNodes=d.nodes || []; debugSuccessRate=d.success_rate || 0;
+        renderDebugNodes(); updateDebugCharts(debugSuccessRate);
+      } catch(e){ showToast(e.message || '请求失败，请重试','error'); }
+    }
+    function renderDebugNodes(resetLimit=false) {
+      if(resetLimit) debugRenderLimit=300;
+      const nodes=window._debugNodes||[],query=document.getElementById('debugNodeSearch').value.trim().toLowerCase();
+      const filtered=nodes.filter(n=>!query || [n.name,n.tag].some(v=>String(v||'').toLowerCase().includes(query)));
+      const visible=filtered.slice(0,debugRenderLimit);
+      document.getElementById('debugFilterCount').textContent=`${filtered.length.toLocaleString()} / ${nodes.length.toLocaleString()} 个节点`;
+      document.getElementById('debugNodesEmpty').hidden=filtered.length>0;
+      document.getElementById('debugNodesTableBody').innerHTML = visible.map(n => {
           const calls = (n.success_count||0)+(n.failure_count||0);
           const sr = calls>0 ? ((n.success_count||0)/calls*100).toFixed(1) : 0;
-          const tl = (n.timeline||[]).map(t => `<div class="tl-dot ${t.success?'success':'error'}" title="${t.latency_ms}ms"></div>`).join('');
+          const tl = (n.timeline||[]).slice(-30).map(t => `<div class="tl-dot ${t.success?'success':'error'}" title="${t.latency_ms}ms"></div>`).join('');
           return `<tr>
             <td><strong class="cell-trunc" style="display:inline-block;vertical-align:bottom" title="${escapeHtml(n.name)}">${escapeHtml(n.name)}</strong><br><span class="cell-trunc" style="display:inline-block;vertical-align:bottom;font-size:11px;color:var(--text-muted)" title="${escapeHtml(n.tag)}">${escapeHtml(n.tag)}</span></td>
             <td class="tt-mono ${sr>80?'':'badge-error'}">${sr}%</td>
@@ -1465,14 +1885,12 @@
             <td><div class="timeline">${tl||'-'}</div></td>
           </tr>`
         }).join('');
-        
-        window._debugNodes = d.nodes || [];
-        updateDebugCharts(d.success_rate || 0);
-
-      } catch(e){}
+      renderPaging('debugNodesPaging',filtered.length,visible.length,'showMoreDebugNodes');
     }
+    function showMoreDebugNodes() { debugRenderLimit+=300; renderDebugNodes(); }
 
-    function updateDebugCharts(globalRate) {
+    function updateDebugCharts(globalRate=debugSuccessRate) {
+      if (typeof echarts === 'undefined') return;
       if(!successRateChartInst) successRateChartInst = initEchart('successRateChart');
       if(!failureChartInst) failureChartInst = initEchart('failureChart');
 
@@ -1531,10 +1949,153 @@
       });
     }
 
+    // Proxy routing sessions are separate from management login sessions.
+    let proxySessions = [];
+    let proxySessionsLoading = false;
+    let proxySessionLimit = 300;
+    let generatedProxyLink = null; // Credentials stay in memory, never localStorage or visible markup.
+    let linkRequestVersion = 0;
+    let linkGenerating = false;
+
+    function clearGeneratedLink() {
+      linkRequestVersion++;
+      generatedProxyLink = null;
+      document.getElementById('generatedLink').hidden = true;
+      document.getElementById('maskedProxyURL').textContent = '';
+      document.getElementById('linkError').hidden = true;
+    }
+    function updateProxyLinkMode() {
+      const named = document.getElementById('proxyLinkMode').value === 'session';
+      document.getElementById('proxySessionIDField').hidden = !named;
+      document.getElementById('proxySessionID').required = named;
+      document.getElementById('proxySessionID').disabled = !named;
+      clearGeneratedLink();
+    }
+    function randomizeSessionID() {
+      const bytes = crypto.getRandomValues(new Uint8Array(8));
+      document.getElementById('proxySessionID').value = 's_' + [...bytes].map(n => n.toString(16).padStart(2,'0')).join('');
+      clearGeneratedLink();
+    }
+    async function generateProxyLink(event) {
+      event.preventDefault();
+      if (linkGenerating) return;
+      clearGeneratedLink();
+      const version = linkRequestVersion;
+      const button = document.getElementById('generateLinkBtn');
+      const sessionID = document.getElementById('proxyLinkMode').value === 'session' ? document.getElementById('proxySessionID').value.trim() : '';
+      if (document.getElementById('proxyLinkMode').value === 'session' && !/^[A-Za-z0-9_-]{1,64}$/.test(sessionID)) {
+        const error = document.getElementById('linkError');
+        error.textContent = '会话 ID 需为 1–64 位英文字母、数字、下划线或连字符。'; error.hidden = false;
+        return;
+      }
+      linkGenerating = true; button.disabled = true;
+      try {
+        const result = await requestJSON('/api/proxy-sessions/links', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id:sessionID,scheme:document.getElementById('proxyLinkScheme').value})});
+        if (version !== linkRequestVersion) return;
+        if (!result.url || !result.masked_url) throw new Error('接入链接格式异常，请重试');
+        generatedProxyLink = result;
+        document.getElementById('maskedProxyURL').textContent = result.masked_url;
+        document.getElementById('generatedLink').hidden = false;
+      } catch (e) {
+        if (version === linkRequestVersion) {
+          const error = document.getElementById('linkError'); error.textContent = e.message; error.hidden = false;
+        }
+      } finally { linkGenerating = false; button.disabled = false; }
+    }
+    function shellQuote(value) { return "'" + String(value).replace(/'/g,"'\\''") + "'"; }
+    async function copyProxyLink(kind) {
+      if (!generatedProxyLink) return;
+      const value = kind === 'curl' ? 'curl --proxy ' + shellQuote(generatedProxyLink.url) + ' ' + shellQuote('https://example.com') : generatedProxyLink.url;
+      try {
+        if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(value);
+        else {
+          const previousFocus = document.activeElement;
+          const field = document.createElement('textarea');
+          field.value = value; field.readOnly = true;
+          field.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+          document.body.appendChild(field); field.select();
+          let copied = false;
+          try { copied = document.execCommand('copy'); }
+          finally { field.remove(); previousFocus?.focus(); }
+          if (!copied) throw new Error('浏览器未允许复制，请使用 HTTPS 或 localhost 后重试');
+        }
+        showToast(kind === 'curl' ? '已复制 curl 命令（含凭据）' : '已复制完整 URL（含凭据）');
+      } catch (e) { showToast(e.message || '复制失败，请重试','error'); }
+    }
+    async function loadProxySessions() {
+      if (proxySessionsLoading) return;
+      proxySessionsLoading = true;
+      const epoch=authEpoch;
+      try {
+        const result = await requestJSON('/api/proxy-sessions');
+        if(epoch!==authEpoch || !authReady) return;
+        proxySessions = result.sessions || [];
+        document.getElementById('proxySessionTotal').textContent = (result.total || 0).toLocaleString();
+        document.getElementById('proxySessionCapacity').textContent = (result.max_sessions || 0).toLocaleString();
+        document.getElementById('proxySessionTTL').textContent = (result.ttl || '—').replace(/(?<=\d[hms])0m0s$/, '').replace(/(?<=\d[hms])0s$/, '');
+        const badge = document.getElementById('sessionEnabledBadge');
+        badge.textContent = result.enabled ? '命名会话已启用' : '命名会话未启用';
+        badge.className = 'badge ' + (result.enabled ? 'badge-healthy' : 'badge-warning');
+        document.getElementById('sessionAvailability').textContent = result.enabled ? '主端口命名会话已就绪。使用 基础用户名.会话ID 接入；普通用户名保持原调度策略。' : (result.reason || '命名会话未启用，请检查运行模式与主入口认证配置。');
+        document.getElementById('proxyLinkMode').querySelector('option[value="session"]').disabled = !result.enabled;
+        if (!result.enabled && document.getElementById('proxyLinkMode').value === 'session') {
+          document.getElementById('proxyLinkMode').value = 'normal'; updateProxyLinkMode();
+        }
+        document.getElementById('clearSessionsBtn').disabled = proxySessions.length === 0;
+        renderProxySessions();
+      } catch (e) {
+        document.getElementById('sessionAvailability').textContent = '会话状态读取失败：' + e.message + '。列表可能已过期，请刷新重试。';
+        document.getElementById('clearSessionsBtn').disabled = true;
+        if (!proxySessions.length) document.getElementById('proxySessionsEmpty').textContent = '绑定列表读取失败，请刷新重试。';
+      } finally { proxySessionsLoading = false; }
+    }
+    function renderProxySessions() {
+      const query = document.getElementById('proxySessionSearch').value.trim().toLowerCase();
+      const filtered = proxySessions.filter(s => !query || [s.id,s.node_id,s.node_tag,s.node_name].some(value => String(value || '').toLowerCase().includes(query)));
+      const visible = filtered.slice(0,proxySessionLimit);
+      document.getElementById('sessionFilterCount').textContent = `${filtered.length.toLocaleString()} / ${proxySessions.length.toLocaleString()} 个绑定`;
+      document.getElementById('proxySessionsBody').innerHTML = visible.map(s => `<tr>
+        <td><strong class="cell-trunc tt-mono" title="${escapeHtml(s.id)}" style="display:block">${escapeHtml(s.id)}</strong></td>
+        <td><span class="cell-trunc" style="display:block" title="${escapeHtml(s.node_name || s.node_id || s.node_tag)}">${escapeHtml(s.node_name || s.node_id || s.node_tag || '—')}</span><span class="form-help tt-mono">${escapeHtml(s.node_tag || '')}</span></td>
+        <td class="tt-mono">${escapeHtml(formatTime(s.created_at))}</td>
+        <td class="tt-mono">${escapeHtml(formatTime(s.last_seen))}<br/><span class="form-help">到期 ${escapeHtml(formatTime(s.expires_at))}</span></td>
+        <td class="tt-mono" title="${escapeHtml(s.last_reason || '')}">${Number(s.switch_count) || 0}</td>
+        <td><button type="button" class="btn btn-sm" data-reset-session="${escapeHtml(s.id)}">重置绑定</button></td>
+      </tr>`).join('');
+      const empty = document.getElementById('proxySessionsEmpty');
+      empty.hidden = filtered.length > 0;
+      empty.textContent = query ? '没有匹配的会话绑定。' : '暂无绑定。使用生成的命名会话链接发起首个连接后，会在这里出现。';
+      const paging = document.getElementById('sessionPagingHint');
+      paging.hidden = filtered.length <= visible.length;
+      paging.innerHTML = `已显示 ${visible.length} / ${filtered.length} 个绑定 <button type="button" class="btn btn-sm" onclick="showMoreProxySessions()">显示更多</button>`;
+    }
+    function showMoreProxySessions() { proxySessionLimit += 300; renderProxySessions(); }
+    document.getElementById('proxySessionsBody').addEventListener('click',event => {
+      const button = event.target.closest('button[data-reset-session]');
+      if (button) resetProxySessions(button.dataset.resetSession,button);
+    });
+    async function resetProxySessions(id, sourceButton) {
+      if (!confirm(id ? `重置会话 ${id} 的绑定？下次连接将重新选择节点，现有连接不会主动断开。` : '重置全部会话绑定？此操作影响所有命名会话的后续连接。')) return;
+      const button = sourceButton || document.getElementById('clearSessionsBtn');
+      button.disabled = true;
+      try {
+        const path = '/api/proxy-sessions' + (id ? '/' + encodeURIComponent(id) : '');
+        const result = await requestJSON(path,{method:'DELETE'});
+        showToast(result.message || '绑定已重置');
+        await loadProxySessions();
+      } catch (e) { showToast(e.message,'error'); }
+      finally { button.disabled = false; if (!id) button.disabled = proxySessions.length === 0; }
+    }
+    window.addEventListener('pagehide',clearGeneratedLink);
+
     // Settings
     async function loadSettingsPage() {
+      const epoch=authEpoch;
+      settingsLoaded = false;
+      document.getElementById('settingsSaveBtn').disabled = true;
       try {
-        const r = await fetch('/api/settings'); const d = await r.json();
+        const r = await apiFetch('/api/settings'); const d = await r.json();
+        if(epoch!==authEpoch || !authReady) return;
         // General
         document.getElementById('settingMode').value = d.mode || 'pool';
         document.getElementById('settingExternalIP').value = d.external_ip||'';
@@ -1563,6 +2124,9 @@
         const st = d.sticky || {};
         document.getElementById('settingStickyEnabled').checked = !!st.enabled;
         document.getElementById('settingStickyPort').value = st.port || '';
+        document.getElementById('settingSessionEnabled').checked=st.session_enabled !== false;
+        document.getElementById('settingSessionTTL').value=st.session_ttl || '24h';
+        document.getElementById('settingSessionCapacity').value=st.max_sessions || 10000;
         // Management
         const mgmt = d.management || {};
         document.getElementById('settingMgmtListen').value = mgmt.listen || '';
@@ -1575,7 +2139,7 @@
         document.getElementById('settingGeoIPListen').value = geo.listen || '';
         document.getElementById('settingGeoIPPort').value = geo.port || '';
         document.getElementById('settingGeoIPAutoUpdate').checked = geo.auto_update_enabled || false;
-        document.getElementById('settingGeoIPUpdateInterval').value = geo.auto_update_interval || '24h0m0s';
+        document.getElementById('settingGeoIPUpdateInterval').value = geo.auto_update_interval && geo.auto_update_interval !== '0s' ? geo.auto_update_interval : '24h';
         // Log
         const logCfg = d.log || {};
         document.getElementById('settingLogOutput').value = logCfg.output || 'stdout';
@@ -1586,19 +2150,25 @@
         toggleLogFileSettings();
         // Subscription
         try {
-          const sr = await fetch('/api/subscription/config'); const sd = await sr.json();
+          const sr = await apiFetch('/api/subscription/config'); const sd = await sr.json();
+          if(epoch!==authEpoch || !authReady) return;
           document.getElementById('settingSubEnabled').checked = sd.enabled || false;
           const iv = sd.interval || '';
           const sel = document.getElementById('settingSubInterval');
-          let matched = false;
-          for (let opt of sel.options) { if (iv === opt.value || iv === opt.value.replace('m','m0s') || iv.startsWith(opt.value)) { sel.value = opt.value; matched = true; break; } }
-          if (!matched) sel.value = '1h';
+          for (const opt of [...sel.options]) { if(opt.dataset.custom) opt.remove(); }
+          let matched=false;
+          const durationSeconds=value => [...String(value).matchAll(/(\d+(?:\.\d+)?)(h|m|s)/g)].reduce((sum,m)=>sum+Number(m[1])*({h:3600,m:60,s:1}[m[2]]),0);
+          for (const opt of sel.options) { if(durationSeconds(iv)>0 && durationSeconds(iv)===durationSeconds(opt.value)) { sel.value=opt.value; matched=true; break; } }
+          if (!matched && iv) { const opt=new Option(`自定义 · ${iv}`,iv); opt.dataset.custom='true'; sel.add(opt); sel.value=iv; }
+          else if (!matched) sel.value='1h';
           document.getElementById('settingSubURLs').value = (sd.subscriptions || []).join('\n');
           _savedSubSnapshot = JSON.stringify({urls: (sd.subscriptions || []).join('\n'), enabled: sd.enabled || false, interval: sel.value});
-        } catch(e){}
+        } catch(e){ throw new Error('订阅配置读取失败：' + e.message); }
         // Take core snapshot after all fields are populated
         _savedCoreSnapshot = _buildCoreSnapshot();
-      } catch(e){ console.error('Failed to load settings:', e); }
+        settingsLoaded = true;
+        document.getElementById('settingsSaveBtn').disabled = false;
+      } catch(e){ showToast('设置读取失败：'+e.message,'error'); }
     }
     function _buildCoreSnapshot() {
       return JSON.stringify({
@@ -1621,6 +2191,9 @@
         pool_ratelimit: document.getElementById('settingPoolRateLimit').value,
         sticky_enabled: document.getElementById('settingStickyEnabled').checked,
         sticky_port: document.getElementById('settingStickyPort').value,
+        session_enabled: document.getElementById('settingSessionEnabled').checked,
+        session_ttl: document.getElementById('settingSessionTTL').value,
+        max_sessions: document.getElementById('settingSessionCapacity').value,
         mgmt_listen: document.getElementById('settingMgmtListen').value,
         mgmt_password: document.getElementById('settingMgmtPassword').value,
         mgmt_probe_concurrency: document.getElementById('settingProbeConcurrency').value,
@@ -1644,8 +2217,10 @@
 
     async function handleSettingsSave(e) {
       e.preventDefault();
+      if (!settingsLoaded) { showToast('配置尚未读取成功，请重新打开系统设置后重试。','error'); return; }
       const saveBtn = e.target.querySelector('button[type="submit"]');
       const originalText = saveBtn.textContent;
+      if(saveBtn.disabled) return;
 
       // Build current snapshots for change detection
       const currentCoreSnapshot = _buildCoreSnapshot();
@@ -1658,9 +2233,10 @@
       const subChanged = currentSubSnapshot !== _savedSubSnapshot;
 
       if (!coreChanged && !subChanged) {
-        showToast('配置未变更'); return;
+        showToast(coreReloadPending ? '设置已保存，请点击「重载核心」应用。' : '配置未变更'); return;
       }
 
+      saveBtn.disabled=true;
       // Save core settings if changed
       if (coreChanged) {
         saveBtn.disabled = true; saveBtn.textContent = '保存中...'; saveBtn.style.opacity = '0.6';
@@ -1691,6 +2267,9 @@
           sticky: {
             enabled: document.getElementById('settingStickyEnabled').checked,
             port: parseInt(document.getElementById('settingStickyPort').value) || 0,
+            session_enabled: document.getElementById('settingSessionEnabled').checked,
+            session_ttl: document.getElementById('settingSessionTTL').value || '24h',
+            max_sessions: parseInt(document.getElementById('settingSessionCapacity').value) || 10000,
           },
           management: {
             listen: document.getElementById('settingMgmtListen').value,
@@ -1714,9 +2293,19 @@
           }
         };
         try {
-          const r = await fetch('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
-          if(!r.ok) { showToast('保存失败', 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
-        } catch(e){ showToast('保存失败', 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
+          const r = await apiFetch('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
+          const result=await r.json();
+          if (result.auth_changed) {
+            _savedCoreSnapshot=currentCoreSnapshot;
+            const password=document.getElementById('settingMgmtPassword').value;
+            if(password) {
+              invalidateAuth(); pendingReloadAfterLogin=true; coreReloadPending=true; document.getElementById('savedSettingsPending').hidden=false; showModal('loginOverlay');
+              showToast('管理密码已保存并立即生效，请重新登录后重载核心。'+(subChanged ? '订阅更改尚未保存。' : ''));
+              saveBtn.disabled=false; saveBtn.textContent=originalText; saveBtn.style.opacity='1'; return;
+            }
+            await refreshAuthStatus(); authReady=true;
+          }
+        } catch(e){ showToast('保存失败：' + e.message, 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
         _savedCoreSnapshot = currentCoreSnapshot;
       }
 
@@ -1725,7 +2314,7 @@
         showFullscreenLoading('更新订阅中...', '正在拉取订阅并重载节点，请稍候');
         const subPayload = { subscriptions: subURLs, enabled: subEnabled, interval: subInterval };
         try {
-          const sr = await fetch('/api/subscription/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(subPayload)});
+          const sr = await apiFetch('/api/subscription/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(subPayload)});
           hideFullscreenLoading();
           if(!sr.ok) { showToast('订阅配置保存失败', 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
           const sd = await sr.json();
@@ -1737,44 +2326,50 @@
           } else {
             showToast('设置已保存');
           }
-        } catch(e){ hideFullscreenLoading(); showToast('订阅配置保存失败', 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
+        } catch(e){ hideFullscreenLoading(); showToast('订阅配置保存失败：' + e.message, 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
       } else if (coreChanged) {
         // Core changed but no sub change — trigger reload
         showFullscreenLoading('重载核心中...', '正在应用新配置');
         try {
-          const rr = await fetch('/api/reload', {method:'POST'});
+          const rr = await apiFetch('/api/reload', {method:'POST'});
           hideFullscreenLoading();
-          if (rr.ok) { showToast('已保存并重载成功'); } else { showToast('已保存，重载失败', 'error'); }
-        } catch(e) { hideFullscreenLoading(); showToast('已保存，重载失败', 'error'); }
+          if (rr.ok) { coreReloadPending=false; document.getElementById('savedSettingsPending').hidden=true; showToast('已保存并重载成功'); } else { showToast('已保存，重载失败', 'error'); }
+        } catch(e) { hideFullscreenLoading(); showToast('已保存，重载失败：' + e.message, 'error'); }
       }
       saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1';
       refresh();
     }
 
     let logPollInterval = null;
+    let logsLoading = false;
+    let logGeneration = 0;
+    let logController = null;
     function startLogPolling() {
-      pollLogs();
-      if (!logPollInterval) logPollInterval = setInterval(pollLogs, 2000);
+      if (!authReady || document.hidden) return;
+      if (!logPollInterval) { pollLogs(); logPollInterval=setInterval(pollLogs,2000); }
     }
     function stopLogPolling() {
-      if (logPollInterval) { clearInterval(logPollInterval); logPollInterval = null; }
+      if (logPollInterval) clearInterval(logPollInterval);
+      logPollInterval=null; logGeneration++;
+      if(logController) logController.abort();
     }
     async function pollLogs() {
+      if (logsLoading || !authReady || document.hidden || !document.getElementById('logsTab').classList.contains('active')) return;
+      logsLoading=true;
+      const generation=logGeneration;
+      const controller=new AbortController(); logController=controller;
       try {
-        const r = await fetch('/api/logs');
-        const d = await r.json();
-        if (d.logs) {
-          const ta = document.getElementById('consoleLogs');
-          const autoScroll = document.getElementById('autoScrollLogs').checked;
-          const prevTop = ta.scrollTop;
-          ta.value = d.logs;
-          if (autoScroll) {
-             ta.scrollTop = ta.scrollHeight;
-          } else {
-             ta.scrollTop = prevTop;
-          }
+        const data=await requestJSON('/api/logs',{signal:controller.signal});
+        if(generation!==logGeneration || !authReady) return;
+        const ta=document.getElementById('consoleLogs'),prevTop=ta.scrollTop;
+        if(typeof data.logs==='string' && ta.value!==data.logs) {
+          ta.value=data.logs;
+          ta.scrollTop=document.getElementById('autoScrollLogs').checked ? ta.scrollHeight : prevTop;
         }
-      } catch(e){}
+        document.getElementById('logStatus').textContent='已同步';
+      } catch(error) {
+        if(generation===logGeneration) document.getElementById('logStatus').textContent='读取失败 · '+error.message;
+      } finally { logsLoading=false; if(logController===controller) logController=null; }
     }
 
     // ─── Theme System: Dark / Light / Auto (follow OS) ───
@@ -1796,7 +2391,6 @@
       }
       const dbg = document.getElementById('debugTab');
       if (dbg && dbg.classList.contains('active')) {
-        if (trafficSource) { trafficSource.close(); trafficSource = null; trafficTime = []; trafficDataUp = []; trafficDataDown = []; }
         if (typeof updateDebugCharts === 'function') updateDebugCharts();
       }
     }

@@ -1,11 +1,13 @@
 package builder
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"net/url"
 	"strconv"
@@ -15,6 +17,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/inbound/session"
 	poolout "easy_proxies/internal/outbound/pool"
 	"easy_proxies/internal/ssuri"
 
@@ -26,6 +29,9 @@ import (
 
 // Build converts high level config into sing-box Options tree.
 func Build(cfg *config.Config) (option.Options, error) {
+	if cfg == nil {
+		return option.Options{}, fmt.Errorf("config is nil")
+	}
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
@@ -36,19 +42,13 @@ func Build(cfg *config.Config) (option.Options, error) {
 	var geoLookup *geoip.Lookup
 	if cfg.GeoIP.Enabled && cfg.GeoIP.DatabasePath != "" {
 		var err error
-		// Use auto-update if enabled
-		if cfg.GeoIP.AutoUpdateEnabled {
-			interval := cfg.GeoIP.AutoUpdateInterval
-			if interval == 0 {
-				interval = 24 * time.Hour // Default to 24 hours
-			}
-			geoLookup, err = geoip.NewWithAutoUpdate(cfg.GeoIP.DatabasePath, interval)
-		} else {
-			geoLookup, err = geoip.New(cfg.GeoIP.DatabasePath)
-		}
+		// This lookup only lives during option construction. A periodic updater
+		// tied to it would stop before the first update and imply false support.
+		geoLookup, err = geoip.New(cfg.GeoIP.DatabasePath)
 		if err != nil {
 			log.Printf("⚠️  GeoIP database load failed: %v (region routing disabled)", err)
 		} else {
+			defer geoLookup.Close()
 			log.Printf("✅ GeoIP database loaded: %s", cfg.GeoIP.DatabasePath)
 		}
 	}
@@ -87,9 +87,10 @@ func Build(cfg *config.Config) (option.Options, error) {
 		memberTags = append(memberTags, tag)
 		baseOutbounds = append(baseOutbounds, outbound)
 		meta := poolout.MemberMeta{
-			Name: node.Name,
-			URI:  node.URI,
-			Mode: cfg.Mode,
+			Identity: fmt.Sprintf("%x", sha256.Sum256([]byte(node.NodeKey()))),
+			Name:     node.Name,
+			URI:      node.URI,
+			Mode:     cfg.Mode,
 		}
 		// For multi-port and hybrid modes, use per-node port
 		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
@@ -177,11 +178,6 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 	}
 
-	// Close GeoIP database after lookup
-	if geoLookup != nil {
-		geoLookup.Close()
-	}
-
 	// Check if we have at least one valid node
 	if len(baseOutbounds) == 0 {
 		return option.Options{}, fmt.Errorf("no valid nodes available (all %d nodes failed to build)", len(cfg.Nodes))
@@ -230,6 +226,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 		inbounds = append(inbounds, inbound)
 		poolOptions := poolout.Options{
+			SessionRouting:    cfg.Sticky.SessionRoutingEnabled() && cfg.Listener.Username != "",
 			Mode:              cfg.Pool.Mode,
 			Members:           memberTags,
 			FailureThreshold:  cfg.Pool.FailureThreshold,
@@ -406,11 +403,15 @@ func Build(cfg *config.Config) (option.Options, error) {
 		Inbounds:  inbounds,
 		Outbounds: outbounds,
 		Route:     &route,
-		Experimental: &option.ExperimentalOptions{
+	}
+	// Untagged local builds must not request an unavailable optional server.
+	// The controller is only needed for the management UI's traffic stream.
+	if clashAPIEnabled && cfg.ManagementEnabled() {
+		opts.Experimental = &option.ExperimentalOptions{
 			ClashAPI: &option.ClashAPIOptions{
 				ExternalController: "127.0.0.1:9092",
 			},
-		},
+		}
 	}
 	return opts, nil
 }
@@ -431,6 +432,16 @@ func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 			Username: cfg.Listener.Username,
 			Password: cfg.Listener.Password,
 		}}
+	}
+	if cfg.Listener.Username != "" && cfg.Sticky.SessionRoutingEnabled() {
+		return option.Inbound{
+			Type: session.Type,
+			Tag:  "http-in",
+			Options: &session.Options{
+				HTTPMixedInboundOptions: *inboundOptions,
+				SessionEnabled:          true,
+			},
+		}, nil
 	}
 	inbound := option.Inbound{
 		Type:    C.TypeMixed,
@@ -480,11 +491,11 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 	if err != nil {
 		normalizedURI, normalized := normalizeHysteria2PortHoppingURI(rawURI)
 		if !normalized {
-			return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
+			return option.Outbound{}, fmt.Errorf("parse uri: %w", uriParseCause(err))
 		}
 		parsed, err = url.Parse(normalizedURI)
 		if err != nil {
-			return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
+			return option.Outbound{}, fmt.Errorf("parse uri: %w", uriParseCause(err))
 		}
 	}
 	switch strings.ToLower(parsed.Scheme) {
@@ -608,7 +619,13 @@ func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOpt
 }
 
 func buildHysteria2Options(u *url.URL, skipCertVerify bool) (option.Hysteria2OutboundOptions, error) {
-	password := u.User.String()
+	if u.User == nil {
+		return option.Hysteria2OutboundOptions{}, errors.New("hysteria2 authentication is missing")
+	}
+	password := u.User.Username()
+	if suffix, present := u.User.Password(); present {
+		password += ":" + suffix
+	}
 	server, port, hopPorts, err := hysteria2HostPort(u, 443)
 	if err != nil {
 		return option.Hysteria2OutboundOptions{}, err
@@ -984,16 +1001,24 @@ func (v *vmessJSON) GetAlterId() int {
 func buildVMessOptions(rawURI string, skipCertVerify bool) (option.VMessOutboundOptions, error) {
 	// Remove vmess:// prefix
 	encoded := strings.TrimPrefix(rawURI, "vmess://")
+	if strings.Contains(encoded, "@") {
+		return buildVMessOptionsFromURL(rawURI, skipCertVerify)
+	}
+	if index := strings.Index(encoded, "#"); index != -1 {
+		encoded = encoded[:index]
+	}
 
 	// Try to decode as base64 JSON (standard format)
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		// Try URL-safe base64
-		decoded, err = base64.RawURLEncoding.DecodeString(encoded)
-		if err != nil {
-			// Try as URL format: vmess://uuid@server:port?...
-			return buildVMessOptionsFromURL(rawURI, skipCertVerify)
+	var decoded []byte
+	var decodeErr error
+	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, decodeErr = encoding.DecodeString(encoded)
+		if decodeErr == nil {
+			break
 		}
+	}
+	if decodeErr != nil {
+		return option.VMessOutboundOptions{}, errors.New("invalid VMess base64 payload")
 	}
 
 	var vmess vmessJSON
@@ -1011,6 +1036,9 @@ func buildVMessOptions(rawURI string, skipCertVerify bool) (option.VMessOutbound
 	port := vmess.GetPort()
 	if port == 0 {
 		port = 443
+	}
+	if port < 1 || port > 65535 {
+		return option.VMessOutboundOptions{}, errors.New("VMess port must be between 1 and 65535")
 	}
 
 	opts := option.VMessOutboundOptions{
@@ -1090,7 +1118,7 @@ func buildVMessOptions(rawURI string, skipCertVerify bool) (option.VMessOutbound
 func buildVMessOptionsFromURL(rawURI string, skipCertVerify bool) (option.VMessOutboundOptions, error) {
 	parsed, err := url.Parse(rawURI)
 	if err != nil {
-		return option.VMessOutboundOptions{}, fmt.Errorf("parse vmess url: %w", err)
+		return option.VMessOutboundOptions{}, fmt.Errorf("parse vmess url: %w", uriParseCause(err))
 	}
 
 	uuid := parsed.User.Username()
@@ -1180,6 +1208,9 @@ func hostPort(u *url.URL, defaultPort int) (string, int, error) {
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return "", 0, fmt.Errorf("invalid port %q", portStr)
+	}
+	if port < 1 || port > 65535 {
+		return "", 0, errors.New("port must be between 1 and 65535")
 	}
 	return host, port, nil
 }
@@ -1278,6 +1309,9 @@ func hysteria2HostPort(u *url.URL, defaultPort int) (string, int, []string, erro
 	}
 
 	if numericPort, err := strconv.Atoi(rawPort); err == nil {
+		if numericPort < 1 || numericPort > 65535 {
+			return "", 0, nil, errors.New("hysteria2 port must be between 1 and 65535")
+		}
 		return host, numericPort, hopPorts, nil
 	}
 
@@ -1366,7 +1400,11 @@ func buildSOCKSOptions(u *url.URL) (option.SOCKSOutboundOptions, error) {
 }
 
 func buildHTTPProxyOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutboundOptions, error) {
-	server, port, err := hostPort(u, 8080)
+	defaultPort := 8080
+	if strings.EqualFold(u.Scheme, "https") {
+		defaultPort = 443
+	}
+	server, port, err := hostPort(u, defaultPort)
 	if err != nil {
 		return option.HTTPOutboundOptions{}, err
 	}
@@ -1429,7 +1467,19 @@ func atoiDefault(value string) int {
 	return v
 }
 
-// printProxyLinks prints all proxy connection information at startup
+func maskedProxyURL(scheme, address string, port uint16, username string) string {
+	if address == "" || address == "0.0.0.0" || address == "::" {
+		address = "127.0.0.1"
+	}
+	u := url.URL{Scheme: scheme, Host: net.JoinHostPort(address, strconv.Itoa(int(port)))}
+	if username != "" {
+		u.User = url.UserPassword(username, "********")
+	}
+	return u.String()
+}
+
+// printProxyLinks describes entry points without putting passwords in console
+// logs. Authenticated management endpoints provide copyable complete links.
 func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta) {
 	log.Println("")
 	log.Println("📡 Proxy Links:")
@@ -1440,15 +1490,14 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 
 	if showPoolEntry {
 		// Pool mode: single entry point for all nodes
-		var auth string
-		if cfg.Listener.Username != "" {
-			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
-		}
-		httpProxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
-		socksProxyURL := fmt.Sprintf("socks5://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
+		httpProxyURL := maskedProxyURL("http", cfg.Listener.Address, cfg.Listener.Port, cfg.Listener.Username)
+		socksProxyURL := maskedProxyURL("socks5", cfg.Listener.Address, cfg.Listener.Port, cfg.Listener.Username)
 		log.Printf("🌐 Pool Entry Point:")
 		log.Printf("   HTTP:   %s", httpProxyURL)
 		log.Printf("   SOCKS5: %s", socksProxyURL)
+		if cfg.Listener.Username != "" && cfg.Sticky.SessionRoutingEnabled() {
+			log.Printf("   Session: %s (replace SESSION with your session ID; password masked)", maskedProxyURL("http", cfg.Listener.Address, cfg.Listener.Port, cfg.Listener.Username+".SESSION"))
+		}
 		log.Println("")
 		log.Printf("   Nodes in pool (%d):", len(metadata))
 		for _, meta := range metadata {
@@ -1456,8 +1505,8 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		}
 		if cfg.Sticky.Enabled {
 			log.Println("")
-			stickyHTTP := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Sticky.Port)
-			stickySOCKS := fmt.Sprintf("socks5://%s%s:%d", auth, cfg.Listener.Address, cfg.Sticky.Port)
+			stickyHTTP := maskedProxyURL("http", cfg.Listener.Address, cfg.Sticky.Port, cfg.Listener.Username)
+			stickySOCKS := maskedProxyURL("socks5", cfg.Listener.Address, cfg.Sticky.Port, cfg.Listener.Username)
 			log.Printf("📌 Sticky Entry Point (pinned by client IP):")
 			log.Printf("   HTTP:   %s", stickyHTTP)
 			log.Printf("   SOCKS5: %s", stickySOCKS)
@@ -1472,18 +1521,12 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		log.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
 		log.Println("")
 		for _, node := range cfg.Nodes {
-			var auth string
 			username := node.Username
-			password := node.Password
 			if username == "" {
 				username = cfg.MultiPort.Username
-				password = cfg.MultiPort.Password
 			}
-			if username != "" {
-				auth = fmt.Sprintf("%s:%s@", username, password)
-			}
-			httpProxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
-			socksProxyURL := fmt.Sprintf("socks5://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
+			httpProxyURL := maskedProxyURL("http", cfg.MultiPort.Address, node.Port, username)
+			socksProxyURL := maskedProxyURL("socks5", cfg.MultiPort.Address, node.Port, username)
 			log.Printf("   [%d] %s", node.Port, node.Name)
 			log.Printf("       HTTP:   %s", httpProxyURL)
 			log.Printf("       SOCKS5: %s", socksProxyURL)
@@ -1595,7 +1638,17 @@ func base64Decode(s string) (string, error) {
 	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
 		return string(b), nil
 	}
-	return "", fmt.Errorf("cannot base64-decode %q", s)
+	return "", errors.New("invalid base64 value")
+}
+
+// url.Parse wraps its cause with the complete input, including proxy passwords.
+// Keep the diagnostic cause without copying credentialed URIs into build logs.
+func uriParseCause(err error) error {
+	var parseError *url.Error
+	if errors.As(err, &parseError) {
+		return parseError.Err
+	}
+	return err
 }
 
 // ---------------------------------------------------------------------------

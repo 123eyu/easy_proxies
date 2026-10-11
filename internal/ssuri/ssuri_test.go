@@ -118,6 +118,25 @@ func TestParseQuery(t *testing.T) {
 	}
 }
 
+func TestParseSIP002OptionalRootPath(t *testing.T) {
+	for _, host := range []string{"example.com:8388", "[2001:db8::1]:8388", "example.com"} {
+		t.Run(host, func(t *testing.T) {
+			got, err := Parse("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@" + host + "/?plugin=v2ray-plugin%3Btls#Node")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Port != 8388 || got.Password != "password" || got.Query.Get("plugin") != "v2ray-plugin;tls" || got.Fragment != "Node" {
+				t.Fatalf("unexpected parsed root-path URI: %+v", got)
+			}
+		})
+	}
+	for _, host := range []string{"example.com:8388/not-a-root-path", "example.com/not-a-root-path", "example.com//"} {
+		if _, err := Parse("ss://aes-256-gcm:password@" + host); err == nil {
+			t.Fatalf("unexpected acceptance of a non-root path: %s", host)
+		}
+	}
+}
+
 func TestParseInvalidURIs(t *testing.T) {
 	tests := []string{
 		"ss://@@@",

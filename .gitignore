@@ -1,14 +1,17 @@
 # Binaries
-easy-proxies
-easy-proxies-*
-easy_proxies
-easy_proxies-*
+/easy-proxies
+/easy-proxies-*
+/easy_proxies
+/easy_proxies-*
 *.exe
 
 # Configuration (contains sensitive data)
 config.yaml
 nodes.txt
 node_ports.json
+config.yaml.lock
+nodes.txt.lock
+node_ports.json.lock
 
 # GeoIP database (auto-downloaded)
 *.mmdb

@@ -132,8 +132,14 @@ func parsePlainUserInfo(userInfo string) (string, string, error) {
 }
 
 func parseHostPort(hostPort string) (string, int, error) {
+	// SIP002 permits an optional root path before the plugin query, e.g.
+	// ss://userinfo@example.com:8388/?plugin=... . It is not part of the port.
+	hostPort = strings.TrimSuffix(hostPort, "/")
 	if hostPort == "" {
 		return "", 0, errors.New("shadowsocks host is required")
+	}
+	if strings.Contains(hostPort, "/") {
+		return "", 0, errors.New("shadowsocks URI supports only an optional root path")
 	}
 
 	host := ""

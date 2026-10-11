@@ -22,8 +22,10 @@ type sharedMemberState struct {
 	// threshold blacklist. Cooldowns must survive the automatic release paths
 	// (see releaseIfPermanent); permanent bans keep their auto-clear behaviour.
 	banIsCooldown bool
-	entry         atomic.Pointer[monitor.EntryHandle]
-	active        atomic.Int32
+	// Operator bans outlive probes and the all-banned recovery path.
+	manualUntil time.Time
+	entry       atomic.Pointer[monitor.EntryHandle]
+	active      atomic.Int32
 }
 
 // failureKind classifies a dial failure so the caller can pick the right
@@ -217,11 +219,12 @@ func (s *sharedMemberState) recordSuccess() {
 // isBlacklisted checks if the node is currently blacklisted, auto-clearing if expired.
 func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 	s.mu.Lock()
-	expired := s.blacklisted && now.After(s.blacklistedUntil)
+	expired := s.blacklisted && !now.Before(s.blacklistedUntil)
 	if expired {
 		s.blacklisted = false
 		s.blacklistedUntil = time.Time{}
 		s.banIsCooldown = false
+		s.manualUntil = time.Time{}
 	}
 	blacklisted := s.blacklisted
 	s.mu.Unlock()
@@ -260,6 +263,7 @@ func (s *sharedMemberState) forceRelease() {
 	s.blacklisted = false
 	s.blacklistedUntil = time.Time{}
 	s.banIsCooldown = false
+	s.manualUntil = time.Time{}
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
@@ -274,7 +278,7 @@ func (s *sharedMemberState) forceRelease() {
 // Returns true when state was cleared.
 func (s *sharedMemberState) releaseIfPermanent(now time.Time) bool {
 	s.mu.Lock()
-	if s.blacklisted && s.banIsCooldown && now.Before(s.blacklistedUntil) {
+	if now.Before(s.manualUntil) || (s.blacklisted && s.banIsCooldown && now.Before(s.blacklistedUntil)) {
 		s.mu.Unlock()
 		return false
 	}
@@ -282,6 +286,7 @@ func (s *sharedMemberState) releaseIfPermanent(now time.Time) bool {
 	s.blacklisted = false
 	s.blacklistedUntil = time.Time{}
 	s.banIsCooldown = false
+	s.manualUntil = time.Time{}
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
@@ -323,6 +328,7 @@ func blacklistSharedMember(tag string, duration time.Duration) {
 		state.blacklisted = true
 		state.blacklistedUntil = until
 		state.banIsCooldown = false // an operator-issued ban is not a cooldown
+		state.manualUntil = until
 		state.failures = 0
 		state.mu.Unlock()
 	}

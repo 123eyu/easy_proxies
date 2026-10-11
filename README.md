@@ -11,11 +11,11 @@
 - **Automatic health checking** with configurable failure thresholds, blacklist duration, and separate cooldowns for transient (timeout/reset/503) and rate-limit (429) failures, plus manual blacklist/release from the dashboard
 - **Automatic fail-over retry**: when a node's dial fails, the request is retried on another healthy node (configurable attempts)
 - **GeoIP region routing**: classify nodes by country and route traffic through a specific region via a dedicated HTTP proxy endpoint
-- **Sticky sessions**: optional dedicated port that pins each client (by source IP) to a fixed upstream node for a stable egress IP, coexisting with the rotating pool entry
+- **Session routing on the main port**: use `username.sessionID` to keep the same upstream node across connections, with failover when that node fails; the bare username keeps normal pool scheduling. The optional legacy source-IP sticky port remains available
 - **Multiple node sources**: inline config, `nodes.txt` file, or subscription URLs (Base64, plain text, Clash YAML)
 - **Subscription auto-refresh with hot-reload**: periodically fetches subscription updates and reloads without restart
 - **Stable per-node ports**: in `multi-port`/`hybrid` mode each node keeps the same local port across subscription refreshes and restarts (persisted to `node_ports.json`)
-- **WebUI dashboard**: real-time node status, traffic charts, diagnostics, log console, and full settings management
+- **WebUI dashboard**: real-time node status, traffic charts, diagnostics, log console, and common runtime/subscription settings
 - **Management API**: RESTful endpoints for node CRUD, probing, blacklisting, subscription management, and config reload
 - **Configurable DNS resolver** with fallback servers and IPv4/IPv6 strategy control
 - **Log rotation**: size-based rotation with configurable backup count, age, and compression
@@ -30,13 +30,13 @@ cp config.example.yaml config.yaml
 touch nodes.txt
 ```
 
-Edit `config.yaml` and add your proxy nodes (inline nodes, `nodes.txt` file, or subscription URLs).
+Edit `config.yaml` and add your proxy nodes (inline nodes, `nodes.txt` file, or subscription URLs). Replace the example `vless://uuid@server:443` entry before use: it is documentation, not a working node. If you use subscriptions or a node file, remove that inline example after configuring the actual source.
 
 > Why `touch nodes.txt`? If you bind-mount a host *file* path that doesn't exist yet (e.g. `-v ./data/nodes.txt:/etc/easy_proxies/nodes.txt`), Docker creates a **directory** named `nodes.txt` on the host and mounts that. The container then sees a directory where it expects a file and fails opaquely. Pre-creating the file (or mapping the **directory** `./data:/etc/easy_proxies`, which auto-generates files) avoids this. If you hit it, run `rm -rf ./data/nodes.txt && touch ./data/nodes.txt` and restart.
 
 ### 2. Run with Docker (Recommended)
 
-Zero-config: config files are auto-generated on first run.
+Config files are auto-generated on first run. The default directory mount reads **`./data/config.yaml`**, not the repository-root `config.yaml`. For a prepared configuration, copy it to `data/config.yaml` before starting; otherwise edit the generated file and configure real nodes before using the proxy.
 
 ```bash
 mkdir -p data logs
@@ -54,13 +54,33 @@ docker compose up -d
 
 ### 3. Run from Source
 
+Use **Go 1.26.9 or newer**; the Docker builder is pinned to Go 1.26.9.
+
 ```bash
 go run ./cmd/easy_proxies --config config.yaml
+```
+
+The default source build excludes optional sing-box features, including the Clash API traffic counters; the management UI still works, but real-time traffic charts need `with_clash_api`. To use the same feature tags as the Docker image:
+
+```bash
+go run -tags "with_utls with_quic with_grpc with_wireguard with_gvisor with_clash_api" \
+  ./cmd/easy_proxies --config config.yaml
 ```
 
 ### 4. Access WebUI
 
 Open `http://localhost:9091` in your browser.
+
+## Upgrading to v3.2.0
+
+See the [bilingual release notes](docs/releases/v3.2.0.md) and [full changelog](CHANGELOG.md). Back up your mounted configuration directory and retain `node_ports.json` before upgrading. To pin the release, set the Compose image to `ghcr.io/jasonwong1991/easy_proxies:3.2.0`; after its publication workflow finishes, run:
+
+```bash
+docker compose pull easy_proxies
+docker compose up -d --force-recreate easy_proxies
+```
+
+Recreating the container clears in-memory named sessions, but saved per-node ports survive. A management password change takes effect immediately and requires a new login. Directory mounts provide atomic configuration replacement; individual-file bind mounts remain compatible through a locked in-place fallback, without the same crash/power-loss atomicity guarantees. Source builds need Go 1.26.9+ and the production feature tags for optional protocols/traffic statistics.
 
 ## Configuration
 
@@ -115,15 +135,52 @@ dns:
 nodes_file: nodes.txt
 ```
 
-### Sticky Proxy (optional, pool/hybrid mode)
+### Session Routing (pool/hybrid mode)
 
-When enabled, a dedicated extra port is opened (default `listener.port + 1`, i.e. `2324`) that coexists with the regular `2323` entry. Clients connecting through the sticky port are pinned to a single upstream node by **source IP**, keeping the egress IP stable instead of rotating on every connection. The pin is permanent until the pinned node is blacklisted/removed. Listen address and credentials are inherited from `listener`.
+The main HTTP/SOCKS5 entry supports both ordinary pool scheduling and fixed-node sessions without another port. Configure a non-empty listener username and use its existing password; a strong, non-empty password is recommended:
 
 ```yaml
+listener:
+  address: 0.0.0.0
+  port: 2323
+  username: wang
+  password: "1234"  # example only; choose your own password
+
 sticky:
-  enabled: true
-  port: 2324    # defaults to listener.port + 1 when omitted
+  session_enabled: true # defaults to true when omitted
+  session_ttl: 24h      # release bindings after this much idle time
+  max_sessions: 10000   # bound session memory usage
+  enabled: false       # legacy source-IP sticky port; independent of session_enabled
+  port: 2324
 ```
+
+| Proxy URL | Routing |
+| --- | --- |
+| `http://wang:1234@127.0.0.1:2323` | Ordinary pool scheduling |
+| `http://wang.account01:1234@127.0.0.1:2323` | Fixed upstream node for session `account01` |
+| `socks5h://wang.account01:1234@127.0.0.1:2323` | The same session over SOCKS5, with proxy-side DNS |
+
+Session IDs are chosen by the client: **1–64 characters matching `[A-Za-z0-9_-]`**. No registration is needed. Reuse an ID to reuse its node; use another ID for a separate binding. Different IDs can still select the same node. The password remains the listener password; the session suffix is not a password or a separate account.
+
+```bash
+# Same session across new HTTP/HTTPS connections.
+curl --proxy 'http://wang.account01:1234@127.0.0.1:2323' https://example.com
+
+# The same session over SOCKS5.
+curl --proxy 'socks5h://wang.account01:1234@127.0.0.1:2323' https://example.com
+```
+
+An unavailable, cooling-down, blacklisted, removed, or dial-failing bound node is replaced according to the pool's availability and retry policy. The new node becomes the session binding. This fixes the **upstream node**, not the node provider's public exit IP. Established tunnels are not migrated, and HTTP application errors do not cause replay of requests already sent.
+
+The fixed binding covers TCP connections (HTTP, CONNECT, and SOCKS5 CONNECT). SOCKS5 UDP can reuse a compatible TCP-bound node, but falls back for that request if necessary without changing the TCP binding; a fixed UDP exit is not guaranteed.
+
+Bindings survive subscription refreshes and core reloads when the same upstream URI identity remains. They expire after the configured idle TTL and may be released when the session capacity is exceeded; a process restart clears all bindings. Idle time is measured from connection dial activity, not traffic on an already-open tunnel. Session routing requires `pool`/`hybrid` mode and a configured listener username. Set `session_enabled: false` to retain exact-username authentication only.
+
+#### Legacy source-IP sticky port
+
+`sticky.enabled: true` still opens the separate legacy entry (default `listener.port + 1`, usually `2324`). Its address and credentials reuse `listener`, and it pins the **client source IP** rather than a username session. For example, `http://wang:1234@127.0.0.1:2324` retains the old behavior. Multiple clients behind the same NAT share that IP-based binding. This option is independent of main-port session routing; `session_ttl` and `max_sessions` do not change the legacy IP binding lifecycle.
+
+See the [session routing guide (Chinese)](docs/session-routing.md) for lifecycle, compatibility, and troubleshooting details.
 
 ### Full Config Reference
 
@@ -265,37 +322,49 @@ Supports Base64, plain text, and Clash YAML formats. When subscriptions are conf
 
 **Stable Ports** (`multi-port`/`hybrid`): each node is identified by a stable key derived from its URI (ignoring the display name and parameter order), so a node keeps the same local port even when the subscription renames or reorders it. Assignments are saved to `node_ports.json` next to `config.yaml` and restored on restart.
 
+For encoded VMess JSON links, the display-name `ps` field, top-level JSON key ordering, and supported base64 encoding variants are also excluded from identity differences. Older port-map keys are automatically normalized on load, preserving existing assignments when upgrading; do not delete `node_ports.json` just to adopt the new identity format.
+
 ## WebUI Dashboard
 
 Access at `http://your-server:9091` (configurable via the `management` section).
 
 Features:
 
-- **Dashboard**: Real-time node status, traffic charts, region availability, latency monitoring
-- **Node Config**: Add/edit/delete inline nodes and subscription URLs
-- **Diagnostics**: Connectivity testing and node state export
-- **Console**: Real-time application logs (last 1000 lines, WebSocket streaming)
-- **Settings**: All configuration options editable from the browser, changes persist to `config.yaml`
+- **Dashboard**: Proxy connection shortcuts, real-time node status, traffic charts, region availability, latency monitoring, connectivity probes, and node exports; node search and status filters
+- **Session Routing**: Generate a session ID and HTTP/SOCKS5 URL, copy the full URL or curl command, inspect bindings, and reset one or all named sessions. Previews and startup logs mask passwords; copied URLs contain the actual proxy credentials
+- **Node Config**: Add/edit/delete inline nodes, with search and on-demand 300-row batches
+- **Diagnostics**: Node statistics and probe timelines, with search and on-demand 300-row batches
+- **Console**: Application logs from the bounded in-memory buffer; polling pauses when the tab is hidden
+- **Settings**: Edit common runtime settings and subscription URLs from the browser; changes persist to `config.yaml`
+
+The dashboard and session page adapt to mobile screens. Current node health follows the backend availability flags rather than historical failure totals; failed operations display errors instead of reporting success.
 
 When `management.password` is empty, authentication is bypassed.
+
+Changing the management password takes effect immediately and invalidates existing login sessions. Sign in again before applying other pending changes. Most proxy/runtime settings still require a reload, which interrupts existing connections. Manual subscription refresh remains available when periodic refresh is disabled; a failed/empty provider keeps the previous subscription set and reports an error.
 
 ## Management API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/auth` | POST | Login with password |
+| `/api/auth` | GET, POST, DELETE | Authentication status, login, logout |
 | `/api/settings` | GET, PUT | Read/update settings |
 | `/api/nodes` | GET | List all nodes with status |
 | `/api/nodes/{tag}/probe` | POST | Test node connectivity |
 | `/api/nodes/{tag}/blacklist` | POST | Manually blacklist a node |
 | `/api/nodes/{tag}/release` | POST | Release node from blacklist |
 | `/api/nodes/probe-all` | POST | Probe all nodes (SSE stream) |
-| `/api/export` | GET | Export node configuration |
+| `/api/export` | GET | Export local proxy URLs; healthy nodes by default, `all=true` for all nodes, `scheme=http/socks5/all` |
 | `/api/subscription/config` | GET, PUT | Manage subscription URLs |
 | `/api/subscription/status` | GET | Check subscription status |
 | `/api/subscription/refresh` | POST | Trigger manual refresh |
 | `/api/nodes/config` | GET, POST, PUT, DELETE | CRUD for node config |
+| `/api/proxy-sessions` | GET, DELETE | List named-session bindings or reset all bindings |
+| `/api/proxy-sessions/{id}` | DELETE | Reset one binding; `id` is the full username, e.g. `wang.account01` |
+| `/api/proxy-sessions/links` | POST | Generate an HTTP/SOCKS5 URL from `session_id` and `scheme`, without connecting or binding a node |
 | `/api/reload` | POST | Reload sing-box instance |
+
+Exported URLs contain actual proxy credentials. Exports and session-link generation avoid wildcard listener addresses and correctly encode credentials and IPv6 hosts; configure `external_ip` when the client-facing host differs from the management host. Generate fixed-session URLs on the Session Routing page rather than treating node exports as session registrations.
 
 ## Docker Deployment
 
@@ -327,7 +396,7 @@ services:
 
 | Port | Usage |
 |------|-------|
-| 2323 | Pool proxy entry (pool/hybrid mode) |
+| 2323 | Main HTTP/SOCKS5 pool entry: bare username for normal scheduling, `username.sessionID` for a fixed-node session |
 | 9091 | WebUI and Management API |
 | 9092 | Internal Clash API (localhost only, traffic stats) |
 | 1221 | GeoIP region router (when enabled, configurable) |
@@ -447,9 +516,21 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Development
 
+Use **Go 1.26.9 or newer** (see `go.mod`) and Node.js 24 for fixture tests. The Docker builder is pinned to Go 1.26.9. The publication workflow requires the checks below before building/publishing images; actual run results are recorded in GitHub Actions:
+
 ```bash
-go test ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+FEATURE_TAGS='with_utls with_quic with_grpc with_wireguard with_gvisor with_clash_api'
+go test -count=1 -tags "$FEATURE_TAGS" ./...
+sh -n entrypoint.sh
+node --test scripts/test-ui.mjs scripts/test-entrypoint.mjs
 ```
+
+For changes affecting runtime behavior, add loopback/temporary-directory regressions rather than testing against live subscriptions. Optional browser tests are in `scripts/test-ui-browser.mjs` (Playwright and Chrome required).
+
+See the [project review and iteration roadmap](docs/project-review-2026-10-11.md) for completed fixes, benchmark scope, upgrade notes, and remaining work. Directory mounts remain recommended for atomic configuration replacement; individual-file mounts use a locked in-place fallback with weaker crash guarantees.
 
 ## Star History
 

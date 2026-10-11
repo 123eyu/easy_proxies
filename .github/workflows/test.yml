@@ -1,0 +1,56 @@
+name: Code Checks
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FEATURE_TAGS: with_utls with_quic with_grpc with_wireguard with_gvisor with_clash_api
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Formatting and static analysis
+        run: |
+          test -z "$(gofmt -l $(git ls-files '*.go'))"
+          go vet ./...
+      - name: Unit and race tests
+        run: |
+          go test -count=1 ./...
+          go test -race -count=1 ./...
+      - name: Docker feature-tag tests
+        run: go test -count=1 -tags "$FEATURE_TAGS" ./...
+      - name: Reachable vulnerability checks (default and production tags)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          GOBIN="$RUNNER_TEMP/bin" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          "$RUNNER_TEMP/bin/govulncheck" ./...
+          "$RUNNER_TEMP/bin/govulncheck" -tags "$FEATURE_TAGS" ./...
+      - name: UI and entrypoint fixture regressions
+        run: |
+          sh -n entrypoint.sh
+          node --test scripts/test-ui.mjs scripts/test-entrypoint.mjs
+      - name: Linux cross-platform builds
+        run: |
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -tags "$FEATURE_TAGS" -o "$RUNNER_TEMP/easy_proxies-$arch" ./cmd/easy_proxies
+          done
