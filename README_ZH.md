@@ -52,7 +52,7 @@ Docker 默认挂载 **`./data`** 目录，实际读取的是 `data/config.yaml`�
 docker compose up -d
 ```
 
-本地运行（需 **Go 1.26.9 或更新版本**，Docker builder 固定为 Go 1.26.9）：
+本地运行（需 **Go 1.26.10 或更新版本**，Docker builder 固定为 Go 1.26.10）：
 
 ```bash
 go run ./cmd/easy_proxies -config config.yaml
@@ -83,7 +83,7 @@ docker compose pull easy_proxies
 docker compose up -d --force-recreate easy_proxies
 ```
 
-重建容器会清空内存中的命名会话，已保存的节点端口仍保留。修改管理密码立即生效，需要重新登录。推荐目录挂载以获得配置原子替换；单文件 bind mount 继续使用锁内原地写兼容路径，但不具备相同的断电/崩溃原子性保障。源码构建需 Go 1.26.9+；可选协议/流量统计还需完整生产标签。
+重建容器会清空内存中的命名会话，已保存的节点端口仍保留。修改管理密码立即生效，需要重新登录。推荐目录挂载以获得配置原子替换；单文件 bind mount 继续使用锁内原地写兼容路径，但不具备相同的断电/崩溃原子性保障。源码构建需 Go 1.26.10+；可选协议/流量统计还需完整生产标签。
 
 ## 最小配置示例（Pool）
 
@@ -444,7 +444,7 @@ docker run --user $(id -u):$(id -g) \
 
 ## 开发验证
 
-使用 **Go 1.26.9 或更新版本**（以 `go.mod` 为准），fixture 测试使用 Node.js 24；Docker builder 固定为 Go 1.26.9。发布工作流要求以下检查通过后才构建/发布镜像，实际运行结果以 GitHub Actions 为准：
+使用 **Go 1.26.10 或更新版本**（以 `go.mod` 为准），fixture 测试使用 Node.js 24；Docker builder 固定为 Go 1.26.10。发布工作流要求以下检查通过后才构建/发布镜像，实际运行结果以 GitHub Actions 为准：
 
 ```bash
 go test -count=1 ./...

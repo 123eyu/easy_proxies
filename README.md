@@ -54,7 +54,7 @@ docker compose up -d
 
 ### 3. Run from Source
 
-Use **Go 1.26.9 or newer**; the Docker builder is pinned to Go 1.26.9.
+Use **Go 1.26.10 or newer**; the Docker builder is pinned to Go 1.26.10.
 
 ```bash
 go run ./cmd/easy_proxies --config config.yaml
@@ -89,7 +89,7 @@ docker compose pull easy_proxies
 docker compose up -d --force-recreate easy_proxies
 ```
 
-Recreating the container clears in-memory named sessions, but saved per-node ports survive. A management password change takes effect immediately and requires a new login. Directory mounts provide atomic configuration replacement; individual-file bind mounts remain compatible through a locked in-place fallback, without the same crash/power-loss atomicity guarantees. Source builds need Go 1.26.9+ and the production feature tags for optional protocols/traffic statistics.
+Recreating the container clears in-memory named sessions, but saved per-node ports survive. A management password change takes effect immediately and requires a new login. Directory mounts provide atomic configuration replacement; individual-file bind mounts remain compatible through a locked in-place fallback, without the same crash/power-loss atomicity guarantees. Source builds need Go 1.26.10+ and the production feature tags for optional protocols/traffic statistics.
 
 ## Configuration
 
@@ -526,7 +526,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Development
 
-Use **Go 1.26.9 or newer** (see `go.mod`) and Node.js 24 for fixture tests. The Docker builder is pinned to Go 1.26.9. The publication workflow requires the checks below before building/publishing images; actual run results are recorded in GitHub Actions:
+Use **Go 1.26.10 or newer** (see `go.mod`) and Node.js 24 for fixture tests. The Docker builder is pinned to Go 1.26.10. The publication workflow requires the checks below before building/publishing images; actual run results are recorded in GitHub Actions:
 
 ```bash
 go test -count=1 ./...
