@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-10-25
+
+### Added
+- `pool.blacklist_failed_pin` (default `true`, editable in the pool settings panel as「绑定节点拨号失败时立即拉黑」) controls whether a named session's failed pin blacklists its node immediately. Set it to `false` to keep the automatic re-route but fall back to the `pool.failure_threshold` accumulation path.
+- Session IDs accept up to 100 characters (`[A-Za-z0-9_-]{1,100}`) instead of 64, in the proxy auth path, the management link API, and the WebUI validation. The listener username plus separator must still fit the SOCKS5 255-byte credential field.
+
+### Fixed
+- Named sessions no longer stay pinned to a dead upstream node. When the dial that fails is the one through the bound node, that request now gets one extra selection even if `retry_enabled: false` or the retry budget is already spent, and a successful re-route migrates the binding; if that attempt fails too, the original pin is kept so a single blip does not silently move the session to another exit. This removes the case where one session ID kept answering `502` while every other session kept working, e.g. `wang.abc_1` failing while `wang.abc-1` succeeded — which is never caused by the character itself, since `_` and `-` are both ordinary session-ID characters.
+- A named session's pinned node is blacklisted immediately when its own dial fails on a transport fault, instead of waiting for `pool.failure_threshold` to accumulate: the re-routed request no longer leaves a dead node in rotation for every other session. 429 and timeout/connection-reset/503 failures keep their configured cooldowns, and UDP packet failures through a TCP pin never blacklist the node. `POST /api/nodes/{tag}/release` or the WebUI still restores it immediately.
+- Reading a session binding no longer renews its idle lifetime. Only a successful dial refreshes `sticky.session_ttl`, so a session whose every attempt fails can expire instead of being kept alive by failed connections, and the LRU order stays aligned with binding expiry.
+
 ## [3.2.0] - 2026-10-12
 
 ### Added

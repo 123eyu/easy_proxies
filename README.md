@@ -71,6 +71,15 @@ go run -tags "with_utls with_quic with_grpc with_wireguard with_gvisor with_clas
 
 Open `http://localhost:9091` in your browser.
 
+## Upgrading to v3.3.0
+
+See the [bilingual release notes](docs/releases/v3.3.0.md) and [full changelog](CHANGELOG.md). Session IDs may now be up to 100 characters, and a named session whose pinned node fails to dial re-routes once and blacklists that node immediately (`pool.blacklist_failed_pin`, default `true`). Pin the image to `ghcr.io/jasonwong1991/easy_proxies:3.3.0` and, after the publication workflow finishes:
+
+```bash
+docker compose pull easy_proxies
+docker compose up -d --force-recreate easy_proxies
+```
+
 ## Upgrading to v3.2.0
 
 See the [bilingual release notes](docs/releases/v3.2.0.md) and [full changelog](CHANGELOG.md). Back up your mounted configuration directory and retain `node_ports.json` before upgrading. To pin the release, set the Compose image to `ghcr.io/jasonwong1991/easy_proxies:3.2.0`; after its publication workflow finishes, run:
@@ -120,6 +129,7 @@ pool:
   rate_limit_cooldown: 60s  # cooldown after HTTP 429; set e.g. 2h to avoid the node longer
   retry_enabled: true # retry on another node when a dial fails
   retry_attempts: 3   # max total dial attempts per request
+  blacklist_failed_pin: true  # blacklist a session pin's node immediately when its dial fails (429/timeout keep their cooldown)
 
 management:
   enabled: true
@@ -160,7 +170,7 @@ sticky:
 | `http://wang.account01:1234@127.0.0.1:2323` | Fixed upstream node for session `account01` |
 | `socks5h://wang.account01:1234@127.0.0.1:2323` | The same session over SOCKS5, with proxy-side DNS |
 
-Session IDs are chosen by the client: **1–64 characters matching `[A-Za-z0-9_-]`**. No registration is needed. Reuse an ID to reuse its node; use another ID for a separate binding. Different IDs can still select the same node. The password remains the listener password; the session suffix is not a password or a separate account.
+Session IDs are chosen by the client: **1–100 characters matching `[A-Za-z0-9_-]`**. No registration is needed. Reuse an ID to reuse its node; use another ID for a separate binding. Different IDs can still select the same node. The password remains the listener password; the session suffix is not a password or a separate account.
 
 ```bash
 # Same session across new HTTP/HTTPS connections.
@@ -170,11 +180,11 @@ curl --proxy 'http://wang.account01:1234@127.0.0.1:2323' https://example.com
 curl --proxy 'socks5h://wang.account01:1234@127.0.0.1:2323' https://example.com
 ```
 
-An unavailable, cooling-down, blacklisted, removed, or dial-failing bound node is replaced according to the pool's availability and retry policy. The new node becomes the session binding. This fixes the **upstream node**, not the node provider's public exit IP. Established tunnels are not migrated, and HTTP application errors do not cause replay of requests already sent.
+An unavailable, cooling-down, blacklisted, removed, or dial-failing bound node is replaced according to the pool's availability and retry policy. The new node becomes the session binding. A dial that fails through the bound node itself always buys one extra selection in that request, even with `retry_enabled: false`, because a dead pin is a binding error rather than a scheduling retry; if that attempt fails too the binding is kept so a single blip does not silently move the session to another exit. That node is also blacklisted on the spot — transport faults for `pool.blacklist_duration` (default 24h) instead of waiting for `pool.failure_threshold`, while 429/timeout failures only take their configured cooldown — so other sessions are no longer routed to it. This fixes the **upstream node**, not the node provider's public exit IP. Established tunnels are not migrated, and HTTP application errors do not cause replay of requests already sent.
 
 The fixed binding covers TCP connections (HTTP, CONNECT, and SOCKS5 CONNECT). SOCKS5 UDP can reuse a compatible TCP-bound node, but falls back for that request if necessary without changing the TCP binding; a fixed UDP exit is not guaranteed.
 
-Bindings survive subscription refreshes and core reloads when the same upstream URI identity remains. They expire after the configured idle TTL and may be released when the session capacity is exceeded; a process restart clears all bindings. Idle time is measured from connection dial activity, not traffic on an already-open tunnel. Session routing requires `pool`/`hybrid` mode and a configured listener username. Set `session_enabled: false` to retain exact-username authentication only.
+Bindings survive subscription refreshes and core reloads when the same upstream URI identity remains. They expire after the configured idle TTL and may be released when the session capacity is exceeded; a process restart clears all bindings. Idle time is renewed only by successful dials: failed attempts do not extend a binding, and traffic on an already-open tunnel does not either. Session routing requires `pool`/`hybrid` mode and a configured listener username. Set `session_enabled: false` to retain exact-username authentication only.
 
 #### Legacy source-IP sticky port
 

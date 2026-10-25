@@ -65,6 +65,15 @@ go run -tags "with_utls with_quic with_grpc with_wireguard with_gvisor with_clas
   ./cmd/easy_proxies -config config.yaml
 ```
 
+## 升级到 v3.3.0
+
+详见 [中英双语发布说明](docs/releases/v3.3.0.md) 和 [完整更新日志](CHANGELOG.md)。会话 ID 上限提升到 100 位；命名会话绑定的节点拨号失败时，本次请求会自动换节点重试，并立即拉黑该节点（`pool.blacklist_failed_pin`，默认 `true`）。固定版本部署时，将 Compose 镜像设为 `ghcr.io/jasonwong1991/easy_proxies:3.3.0`；该版本镜像发布工作流完成后执行：
+
+```bash
+docker compose pull easy_proxies
+docker compose up -d --force-recreate easy_proxies
+```
+
 ## 升级到 v3.2.0
 
 详见 [中英双语发布说明](docs/releases/v3.2.0.md) 和 [完整更新日志](CHANGELOG.md)。升级前备份挂载的配置目录，并保留 `node_ports.json`。固定版本部署时，将 Compose 镜像设为 `ghcr.io/jasonwong1991/easy_proxies:3.2.0`；该版本镜像发布工作流完成后执行：
@@ -95,6 +104,7 @@ pool:
   rate_limit_cooldown: 60s  # HTTP 429 限流后的冷却时间，可设为 2h 以更长时间避开该节点
   retry_enabled: true # 拨号失败时切换到另一节点重试
   retry_attempts: 3   # 每个请求的最大拨号次数
+  blacklist_failed_pin: true  # 命名会话绑定的节点拨号失败时立即拉黑（429/超时类仍只冷却）
 
 management:
   enabled: true
@@ -203,7 +213,7 @@ sticky:
 | `http://wang.account01:1234@127.0.0.1:2323` | 会话 `account01` 固定同一上游节点 |
 | `socks5h://wang.account01:1234@127.0.0.1:2323` | SOCKS5 使用同一会话，由代理解析目标域名 |
 
-会话 ID 由客户端自定义，无需提前注册，支持 **1–64 个 `[A-Za-z0-9_-]` 字符**。同一 ID 复用同一绑定，换一个 ID 就建立独立绑定，但不同 ID 不保证分配不同节点。密码仍是 listener 密码；后缀不是新账号或认证密码。
+会话 ID 由客户端自定义，无需提前注册，支持 **1–100 个 `[A-Za-z0-9_-]` 字符**。同一 ID 复用同一绑定，换一个 ID 就建立独立绑定，但不同 ID 不保证分配不同节点。密码仍是 listener 密码；后缀不是新账号或认证密码。
 
 ```bash
 # 多次新建连接使用同一会话。
@@ -213,10 +223,10 @@ curl --proxy 'http://wang.account01:1234@127.0.0.1:2323' https://example.com
 curl --proxy 'socks5h://wang.account01:1234@127.0.0.1:2323' https://example.com
 ```
 
-- 绑定节点不可用、进入冷却/黑名单、被移除或拨号失败时，按池可用性与重试策略切换，并保留新绑定。
+- 绑定节点不可用、进入冷却/黑名单、被移除或拨号失败时，按池可用性与重试策略切换，并保留新绑定。绑定的节点自身拨号失败时，本次请求会额外重新选一次节点（即使 `retry_enabled: false`），成功后迁移绑定；这一次也失败则保留原绑定，避免一次抖动就更换出口。该节点同时立即拉黑（真实传输故障按 `pool.blacklist_duration`，默认 24h；429/超时类只按冷却处理），其它会话不再被分配到它。
 - 固定的是**上游节点**，不保证节点提供方的公网出口 IP 永久不变。已经建立的连接不迁移，已发送请求不会因 HTTP 业务错误自动重放。
 - 固定绑定针对 TCP（HTTP、CONNECT、SOCKS5 CONNECT）。SOCKS5 UDP 可优先复用支持 UDP 的绑定节点；需要回退时只影响该请求，不改 TCP 绑定，不保证 UDP 固定出口。
-- 订阅刷新与核心重载时，仍存在的同一 URI 稳定身份可保留绑定；空闲超过 TTL 或触及容量清理时可释放绑定。空闲时间按新连接拨号活动计算，长连接中的持续流量不续期。**进程重启会清空会话**。
+- 订阅刷新与核心重载时，仍存在的同一 URI 稳定身份可保留绑定；空闲超过 TTL 或触及容量清理时可释放绑定。空闲时间只由**成功拨号**续期，失败连接不续期，长连接中的持续流量也不续期。**进程重启会清空会话**。
 - 该功能要求 `pool`/`hybrid` 模式且 listener 已配置非空用户名。设置 `session_enabled: false` 可恢复仅接受完整普通用户名的认证方式。
 
 ### 旧来源 IP 粘性端口兼容
