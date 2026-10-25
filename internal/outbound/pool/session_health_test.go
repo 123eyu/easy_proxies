@@ -31,7 +31,7 @@ func TestSessionRoutingUnavailablePinMovesWithoutAffectingOtherKeys(t *testing.T
 	assertSessionTestSamePin(t, sessionTestBinding(t, p.sessionStore, after.ID), after)
 }
 
-func TestSessionRoutingDisabledRetryPreservesFailedPin(t *testing.T) {
+func TestSessionRoutingDisabledRetryStillReroutesStalePin(t *testing.T) {
 	a, b := newSessionTestOutbound("a"), newSessionTestOutbound("b")
 	p := newSessionTestPool(nil, a, b)
 	ctx := sessionTestContext(p, "account-session-no-retry")
@@ -39,13 +39,25 @@ func TestSessionRoutingDisabledRetryPreservesFailedPin(t *testing.T) {
 	before := sessionTestBinding(t, p.sessionStore, "account-session-no-retry")
 	p.options.RetryEnabled = false
 	a.setDialHook(func(context.Context) error { return errors.New("fixture dial failure") })
+	// A failed dial through the pinned node is a stale-binding error, not a
+	// pool scheduling retry: the request re-routes once even with retries
+	// disabled, because otherwise that session would keep failing until the
+	// pin idled out or an operator reset it.
+	mustSessionTestDial(t, ctx, p, "b")
+	after := sessionTestBinding(t, p.sessionStore, before.ID)
+	if after.NodeID != "identity-b" || after.SwitchCount != before.SwitchCount+1 || after.LastReason != "dial_failed" {
+		t.Fatalf("stale pin was not migrated: %+v", after)
+	}
+	if calls, _, _ := a.counts(); calls != 2 {
+		t.Fatalf("stale pin caused %d dials through a, want 2", calls)
+	}
+	// If the re-route fails too, the pin is kept so a transient outage does not
+	// silently move the session to another exit.
+	b.setDialHook(func(context.Context) error { return errors.New("fixture dial failure") })
 	if _, err := sessionTestDialTag(ctx, p); err == nil {
 		t.Fatal("failed dial unexpectedly succeeded with retry disabled")
 	}
-	assertSessionTestSamePin(t, sessionTestBinding(t, p.sessionStore, before.ID), before)
-	if calls, _, _ := b.counts(); calls != 0 {
-		t.Fatalf("retry-disabled request reached an alternate member %d times", calls)
-	}
+	assertSessionTestSamePin(t, sessionTestBinding(t, p.sessionStore, after.ID), after)
 }
 
 func TestSessionRoutingPacketFailureFallbackPreservesTCPPin(t *testing.T) {
@@ -117,5 +129,75 @@ func TestSessionRoutingConcurrentFailoverCommitsOneMigration(t *testing.T) {
 	after := sessionTestBinding(t, p.sessionStore, before.ID)
 	if after.NodeID != "identity-b" || after.SwitchCount != 1 || after.CreatedAt != before.CreatedAt {
 		t.Fatalf("concurrent failover did not commit exactly one migration: %+v", after)
+	}
+}
+
+// A transport fault seen through a session's pinned node blacklists that node
+// right away, so neither the session nor ordinary scheduling keeps retrying it.
+func TestSessionRoutingPinnedFailureBlacklistsNodeImmediately(t *testing.T) {
+	a, b := newSessionTestOutbound("a"), newSessionTestOutbound("b")
+	p := newSessionTestPool(nil, a, b)
+	ctx := sessionTestContext(p, "account-session-blacklist")
+	mustSessionTestDial(t, ctx, p, "a")
+	a.setDialHook(func(context.Context) error {
+		return errors.New("tls handshake: remote error: tls: unrecognized name")
+	})
+	mustSessionTestDial(t, ctx, p, "b")
+	pin := p.members[0]
+	if remaining := pin.shared.blacklistRemaining(time.Now()); remaining < time.Hour {
+		t.Fatalf("pinned node blacklist = %v, want the configured duration", remaining)
+	}
+	if pin.shared.banIsCooldown {
+		t.Fatal("transport fault was recorded as a cooldown, not a blacklist")
+	}
+	// Another session must not be handed the blacklisted node.
+	mustSessionTestDial(t, sessionTestContext(p, "account-session-blacklist-other"), p, "b")
+}
+
+// A pinned node that only reports 429/timeout keeps the short cooldown: those
+// failures say nothing about the node's long-term health and expire on their own.
+func TestSessionRoutingPinnedTransientFailureCoolsDown(t *testing.T) {
+	a, b := newSessionTestOutbound("a"), newSessionTestOutbound("b")
+	p := newSessionTestPool(nil, a, b)
+	ctx := sessionTestContext(p, "account-session-cooldown")
+	mustSessionTestDial(t, ctx, p, "a")
+	a.setDialHook(func(context.Context) error { return errors.New("i/o timeout") })
+	mustSessionTestDial(t, ctx, p, "b")
+	pin := p.members[0]
+	remaining := pin.shared.blacklistRemaining(time.Now())
+	if remaining <= 0 || remaining > 2*time.Minute {
+		t.Fatalf("transient failure pause = %v, want the transient cooldown", remaining)
+	}
+	if !pin.shared.banIsCooldown {
+		t.Fatal("transient failure was recorded as a permanent blacklist")
+	}
+	mustSessionTestDial(t, sessionTestContext(p, "account-session-cooldown-other"), p, "b")
+}
+
+// blacklist_failed_pin: false keeps the re-route but returns the node to the
+// ordinary threshold path, so an operator who disabled it keeps the node in
+// rotation until failure_threshold dials count up.
+func TestSessionRoutingFailedPinBlacklistCanBeDisabled(t *testing.T) {
+	a, b := newSessionTestOutbound("a"), newSessionTestOutbound("b")
+	p := newSessionTestPool(nil, a, b)
+	disabled := false
+	p.options.BlacklistFailedPin = &disabled
+	ctx := sessionTestContext(p, "account-session-blacklist-off")
+	mustSessionTestDial(t, ctx, p, "a")
+	a.setDialHook(func(context.Context) error {
+		return errors.New("tls handshake: remote error: tls: unrecognized name")
+	})
+	mustSessionTestDial(t, ctx, p, "b")
+	if got := sessionTestBinding(t, p.sessionStore, "account-session-blacklist-off").NodeID; got != "identity-b" {
+		t.Fatalf("binding = %q, want the re-routed identity-b", got)
+	}
+	if remaining := p.members[0].shared.blacklistRemaining(time.Now()); remaining != 0 {
+		t.Fatalf("disabled immediate blacklist still banned the node for %v", remaining)
+	}
+	p.members[0].shared.mu.Lock()
+	failures := p.members[0].shared.failures
+	p.members[0].shared.mu.Unlock()
+	if failures != 1 {
+		t.Fatalf("failures = %d, want one counted toward failure_threshold", failures)
 	}
 }

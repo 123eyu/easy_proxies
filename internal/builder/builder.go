@@ -226,16 +226,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 		inbounds = append(inbounds, inbound)
 		poolOptions := poolout.Options{
-			SessionRouting:    cfg.Sticky.SessionRoutingEnabled() && cfg.Listener.Username != "",
-			Mode:              cfg.Pool.Mode,
-			Members:           memberTags,
-			FailureThreshold:  cfg.Pool.FailureThreshold,
-			BlacklistDuration: cfg.Pool.BlacklistDuration,
-			TransientCooldown: cfg.Pool.TransientCooldown,
-			RateLimitCooldown: cfg.Pool.RateLimitCooldown,
-			RetryEnabled:      cfg.Pool.RetryEnabledOrDefault(),
-			RetryAttempts:     cfg.Pool.RetryAttempts,
-			Metadata:          metadata,
+			SessionRouting:     cfg.Sticky.SessionRoutingEnabled() && cfg.Listener.Username != "",
+			Mode:               cfg.Pool.Mode,
+			Members:            memberTags,
+			FailureThreshold:   cfg.Pool.FailureThreshold,
+			BlacklistDuration:  cfg.Pool.BlacklistDuration,
+			TransientCooldown:  cfg.Pool.TransientCooldown,
+			RateLimitCooldown:  cfg.Pool.RateLimitCooldown,
+			RetryEnabled:       cfg.Pool.RetryEnabledOrDefault(),
+			BlacklistFailedPin: cfg.Pool.BlacklistFailedPin,
+			RetryAttempts:      cfg.Pool.RetryAttempts,
+			Metadata:           metadata,
 		}
 		outbounds = append(outbounds, option.Outbound{
 			Type:    poolout.Type,
@@ -255,16 +256,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 			}
 			inbounds = append(inbounds, stickyInbound)
 			stickyOptions := poolout.Options{
-				Mode:              cfg.Pool.Mode,
-				Members:           memberTags,
-				FailureThreshold:  cfg.Pool.FailureThreshold,
-				BlacklistDuration: cfg.Pool.BlacklistDuration,
-				TransientCooldown: cfg.Pool.TransientCooldown,
-				RateLimitCooldown: cfg.Pool.RateLimitCooldown,
-				RetryEnabled:      cfg.Pool.RetryEnabledOrDefault(),
-				RetryAttempts:     cfg.Pool.RetryAttempts,
-				Metadata:          metadata,
-				Sticky:            true,
+				Mode:               cfg.Pool.Mode,
+				Members:            memberTags,
+				FailureThreshold:   cfg.Pool.FailureThreshold,
+				BlacklistDuration:  cfg.Pool.BlacklistDuration,
+				TransientCooldown:  cfg.Pool.TransientCooldown,
+				RateLimitCooldown:  cfg.Pool.RateLimitCooldown,
+				RetryEnabled:       cfg.Pool.RetryEnabledOrDefault(),
+				BlacklistFailedPin: cfg.Pool.BlacklistFailedPin,
+				RetryAttempts:      cfg.Pool.RetryAttempts,
+				Metadata:           metadata,
+				Sticky:             true,
 			}
 			outbounds = append(outbounds, option.Outbound{
 				Type:    poolout.Type,
@@ -299,15 +301,16 @@ func Build(cfg *config.Config) (option.Options, error) {
 			perMeta := map[string]poolout.MemberMeta{tag: meta}
 			poolTag := fmt.Sprintf("%s-%s", poolout.Tag, tag)
 			perOptions := poolout.Options{
-				Mode:              "sequential",
-				Members:           []string{tag},
-				FailureThreshold:  cfg.Pool.FailureThreshold,
-				BlacklistDuration: cfg.Pool.BlacklistDuration,
-				TransientCooldown: cfg.Pool.TransientCooldown,
-				RateLimitCooldown: cfg.Pool.RateLimitCooldown,
-				RetryEnabled:      cfg.Pool.RetryEnabledOrDefault(),
-				RetryAttempts:     cfg.Pool.RetryAttempts,
-				Metadata:          perMeta,
+				Mode:               "sequential",
+				Members:            []string{tag},
+				FailureThreshold:   cfg.Pool.FailureThreshold,
+				BlacklistDuration:  cfg.Pool.BlacklistDuration,
+				TransientCooldown:  cfg.Pool.TransientCooldown,
+				RateLimitCooldown:  cfg.Pool.RateLimitCooldown,
+				RetryEnabled:       cfg.Pool.RetryEnabledOrDefault(),
+				BlacklistFailedPin: cfg.Pool.BlacklistFailedPin,
+				RetryAttempts:      cfg.Pool.RetryAttempts,
+				Metadata:           perMeta,
 			}
 			perPool := option.Outbound{
 				Type:    poolout.Type,
@@ -366,15 +369,16 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 			regionPoolTag := fmt.Sprintf("pool-%s", region)
 			regionPoolOptions := poolout.Options{
-				Mode:              cfg.Pool.Mode,
-				Members:           members,
-				FailureThreshold:  cfg.Pool.FailureThreshold,
-				BlacklistDuration: cfg.Pool.BlacklistDuration,
-				TransientCooldown: cfg.Pool.TransientCooldown,
-				RateLimitCooldown: cfg.Pool.RateLimitCooldown,
-				RetryEnabled:      cfg.Pool.RetryEnabledOrDefault(),
-				RetryAttempts:     cfg.Pool.RetryAttempts,
-				Metadata:          regionMeta,
+				Mode:               cfg.Pool.Mode,
+				Members:            members,
+				FailureThreshold:   cfg.Pool.FailureThreshold,
+				BlacklistDuration:  cfg.Pool.BlacklistDuration,
+				TransientCooldown:  cfg.Pool.TransientCooldown,
+				RateLimitCooldown:  cfg.Pool.RateLimitCooldown,
+				RetryEnabled:       cfg.Pool.RetryEnabledOrDefault(),
+				BlacklistFailedPin: cfg.Pool.BlacklistFailedPin,
+				RetryAttempts:      cfg.Pool.RetryAttempts,
+				Metadata:           regionMeta,
 			}
 			outbounds = append(outbounds, option.Outbound{
 				Type:    poolout.Type,

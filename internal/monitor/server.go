@@ -989,11 +989,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"password":  cfg.MultiPort.Password,
 			}
 			resp["pool"] = map[string]any{
-				"mode":                cfg.Pool.Mode,
-				"failure_threshold":   cfg.Pool.FailureThreshold,
-				"blacklist_duration":  cfg.Pool.BlacklistDuration.String(),
-				"transient_cooldown":  cfg.Pool.TransientCooldown.String(),
-				"rate_limit_cooldown": cfg.Pool.RateLimitCooldown.String(),
+				"mode":                 cfg.Pool.Mode,
+				"failure_threshold":    cfg.Pool.FailureThreshold,
+				"blacklist_duration":   cfg.Pool.BlacklistDuration.String(),
+				"transient_cooldown":   cfg.Pool.TransientCooldown.String(),
+				"rate_limit_cooldown":  cfg.Pool.RateLimitCooldown.String(),
+				"blacklist_failed_pin": cfg.Pool.BlacklistFailedPinOrDefault(),
 			}
 			resp["sticky"] = map[string]any{
 				"enabled":         cfg.Sticky.Enabled,
@@ -1036,11 +1037,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				Password string `json:"password"`
 			} `json:"multi_port,omitempty"`
 			Pool *struct {
-				Mode              string `json:"mode"`
-				FailureThreshold  int    `json:"failure_threshold"`
-				BlacklistDuration string `json:"blacklist_duration"`
-				TransientCooldown string `json:"transient_cooldown"`
-				RateLimitCooldown string `json:"rate_limit_cooldown"`
+				Mode               string `json:"mode"`
+				FailureThreshold   int    `json:"failure_threshold"`
+				BlacklistDuration  string `json:"blacklist_duration"`
+				TransientCooldown  string `json:"transient_cooldown"`
+				RateLimitCooldown  string `json:"rate_limit_cooldown"`
+				BlacklistFailedPin *bool  `json:"blacklist_failed_pin"`
 			} `json:"pool,omitempty"`
 			Sticky *struct {
 				Enabled        *bool   `json:"enabled"`
@@ -1170,6 +1172,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if req.Pool != nil {
 			candidate.Pool.Mode = req.Pool.Mode
 			candidate.Pool.FailureThreshold = req.Pool.FailureThreshold
+			if req.Pool.BlacklistFailedPin != nil {
+				value := *req.Pool.BlacklistFailedPin
+				candidate.Pool.BlacklistFailedPin = &value
+			}
 			if req.Pool.BlacklistDuration != "" {
 				if d, err := time.ParseDuration(req.Pool.BlacklistDuration); err == nil {
 					candidate.Pool.BlacklistDuration = d

@@ -183,7 +183,9 @@ func (l *Lease) Release() {
 	})
 }
 
-// Binding reads and touches the current pin, extending its idle lifetime.
+// Binding reads the current pin without extending its idle lifetime. Only a
+// successful dial commits and renews a binding, so a session whose every dial
+// fails can still idle out instead of being kept alive by failed attempts.
 func (l *Lease) Binding() (Binding, bool) {
 	s := l.store
 	s.mu.Lock()
@@ -191,18 +193,14 @@ func (l *Lease) Binding() (Binding, bool) {
 	if l.released || l.epoch != s.epoch || l.version != l.gate.version {
 		return Binding{}, false
 	}
-	now := s.now()
 	entry, exists := s.entries[l.key]
 	if !exists {
 		return Binding{}, false
 	}
-	if !now.Before(entry.binding.ExpiresAt) {
+	if !s.now().Before(entry.binding.ExpiresAt) {
 		s.removeLocked(l.key, entry)
 		return Binding{}, false
 	}
-	entry.binding.LastSeen = now
-	entry.binding.ExpiresAt = now.Add(s.ttl)
-	s.lru.MoveToFront(entry.element)
 	return entry.binding, true
 }
 

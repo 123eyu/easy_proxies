@@ -60,19 +60,20 @@ func TestStoreIdleExpiryAndLRUEviction(t *testing.T) {
 	store := NewStore(2, time.Hour)
 	store.now = func() time.Time { return now }
 	bindForTest(t, store, "a", "node-a")
+	firstA := store.List()[0]
 	now = now.Add(time.Minute)
 	bindForTest(t, store, "b", "node-b")
 	now = now.Add(time.Minute)
 	lease, _ := store.Acquire(context.Background(), "a")
 	binding, exists := lease.Binding()
 	lease.Release()
-	if !exists || binding.LastSeen != now || binding.ExpiresAt != now.Add(time.Hour) {
-		t.Fatalf("request did not refresh idle expiry: %+v, exists=%v", binding, exists)
+	if !exists || !binding.LastSeen.Equal(firstA.LastSeen) || !binding.ExpiresAt.Equal(firstA.ExpiresAt) {
+		t.Fatalf("lookup extended the idle lifetime: %+v, exists=%v", binding, exists)
 	}
 	bindForTest(t, store, "c", "node-c")
 	bindings := store.List()
-	if len(bindings) != 2 || bindings[0].ID != "a" || bindings[1].ID != "c" {
-		t.Fatalf("expected LRU eviction of b, got %+v", bindings)
+	if len(bindings) != 2 || bindings[0].ID != "b" || bindings[1].ID != "c" {
+		t.Fatalf("expected LRU eviction of the least recently dialed session, got %+v", bindings)
 	}
 	// Listing is observational: even repeated reads must not keep a session alive.
 	now = now.Add(59 * time.Minute)

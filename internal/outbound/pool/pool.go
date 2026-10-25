@@ -56,6 +56,10 @@ type Options struct {
 	RateLimitCooldown time.Duration
 	// RetryEnabled toggles automatic fail-over on dial failure.
 	RetryEnabled bool
+	// BlacklistFailedPin blacklists a node immediately when a named session's
+	// pinned dial fails on a permanent fault, instead of waiting for the
+	// failure threshold. nil means enabled (the default).
+	BlacklistFailedPin *bool
 	// RetryAttempts is the maximum total dial attempts (including the first).
 	// Multi-member pools pick a different member per retry; single-member pools retry the same member.
 	RetryAttempts int
@@ -324,13 +328,14 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		tried = make(map[string]bool, maxAttempts)
 	}
 	var lastErr error
+	pinned := binding.NodeID
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		var member *memberState
 		if lease != nil {
-			member, err = p.pickMemberForSession(network, tried, binding.NodeID)
+			member, err = p.pickMemberForSession(network, tried, pinned)
 		} else {
 			member, err = p.pickMemberFiltered(network, tried, stickyKey)
 		}
@@ -348,10 +353,17 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			p.recordFailure(member, dialErr)
+			if lease != nil && pinned != "" && p.memberIdentity(member) == pinned {
+				p.recordPinFailure(member, dialErr)
+			} else {
+				p.recordFailure(member, dialErr)
+			}
 			lastErr = dialErr
 			if tried != nil {
 				tried[member.tag] = true
+			}
+			if lease != nil {
+				p.dropFailedPin(&pinned, &tried, &maxAttempts, attempt, member, singleMember)
 			}
 			if attempt < maxAttempts {
 				p.logger.Warn("dial via ", member.tag, " failed (attempt ", attempt, "/", maxAttempts, "), retrying: ", dialErr)
@@ -406,6 +418,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		tried = make(map[string]bool, maxAttempts)
 	}
 	var lastErr error
+	pinned := binding.NodeID
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -414,7 +427,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		if lease != nil {
 			// UDP may use the TCP pin if supported, but capability filtering and
 			// packet retries must never migrate the primary TCP binding.
-			member, err = p.pickMemberForSession(N.NetworkUDP, tried, binding.NodeID)
+			member, err = p.pickMemberForSession(N.NetworkUDP, tried, pinned)
 		} else {
 			member, err = p.pickMemberFiltered(N.NetworkUDP, tried, stickyKey)
 		}
@@ -431,10 +444,16 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
+			// The pin is a TCP binding reused opportunistically for UDP, so a
+			// packet failure is not evidence that its TCP dial path is dead and
+			// must not blacklist the node.
 			p.recordFailure(member, listenErr)
 			lastErr = listenErr
 			if tried != nil {
 				tried[member.tag] = true
+			}
+			if lease != nil {
+				p.dropFailedPin(&pinned, &tried, &maxAttempts, attempt, member, singleMember)
 			}
 			if attempt < maxAttempts {
 				p.logger.Warn("listen-packet via ", member.tag, " failed (attempt ", attempt, "/", maxAttempts, "), retrying: ", listenErr)
@@ -489,6 +508,30 @@ func (p *poolOutbound) memberIdentity(member *memberState) string {
 		return identity
 	}
 	return member.tag
+}
+
+// dropFailedPin forgets a named session's pin when the failure came from the
+// pinned node itself, and buys the current request one extra selection so a
+// healthy pool is not reported as unreachable merely because the stale pin was
+// tried first. Later requests start from a fresh selection, and a successful
+// re-route commits the new pin through Lease.Bind.
+func (p *poolOutbound) dropFailedPin(pinned *string, tried *map[string]bool, maxAttempts *int, attempt int, member *memberState, singleMember bool) {
+	if *pinned == "" || p.memberIdentity(member) != *pinned {
+		return
+	}
+	*pinned = ""
+	if singleMember {
+		// A single-member pool has nothing to re-route to; the binding simply
+		// stops being preferred so the next request re-selects.
+		return
+	}
+	if *tried == nil {
+		*tried = make(map[string]bool, *maxAttempts+1)
+	}
+	(*tried)[member.tag] = true
+	if *maxAttempts <= attempt {
+		*maxAttempts = attempt + 1
+	}
 }
 
 // maxAttempts returns the configured retry budget (>=1).
@@ -786,17 +829,28 @@ func (p *poolOutbound) selectByMode(candidates []*memberState) *memberState {
 	}
 }
 
-func (p *poolOutbound) recordFailure(member *memberState, cause error) {
-	if member.shared == nil {
-		p.logger.Warn("proxy ", member.tag, " failure (no shared state): ", cause)
-		return
-	}
-	policy := failurePolicy{
+// blacklistFailedPin reports whether a failed session pin blacklists its node
+// immediately. Unset options keep the protection enabled.
+func (p *poolOutbound) blacklistFailedPin() bool {
+	return p.options.BlacklistFailedPin == nil || *p.options.BlacklistFailedPin
+}
+
+// failurePolicy snapshots the pool's failure-handling tunables.
+func (p *poolOutbound) failurePolicy() failurePolicy {
+	return failurePolicy{
 		Threshold:         p.options.FailureThreshold,
 		BlacklistDuration: p.options.BlacklistDuration,
 		TransientCooldown: p.options.TransientCooldown,
 		RateLimitCooldown: p.options.RateLimitCooldown,
 	}
+}
+
+func (p *poolOutbound) recordFailure(member *memberState, cause error) {
+	if member.shared == nil {
+		p.logger.Warn("proxy ", member.tag, " failure (no shared state): ", cause)
+		return
+	}
+	policy := p.failurePolicy()
 	failures, blacklisted, until, kind := member.shared.recordFailure(cause, policy)
 	switch {
 	case kind == faultRateLimit:
@@ -823,6 +877,24 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error) {
 		p.logger.Warn("proxy ", member.tag, " failure ", failures, "/", p.options.FailureThreshold, ": ", cause)
 		log.Printf("[pool] %s failure %d/%d: %v", member.tag, failures, p.options.FailureThreshold, cause)
 	}
+}
+
+// recordPinFailure records a dial failure that came through a named session's
+// pinned node. The binding is proven unusable, so a real transport fault
+// blacklists that node immediately instead of waiting for the failure
+// threshold; a node that only answers 429/timeout keeps its configured
+// cooldown, because those say nothing about the rest of the pool and expire on
+// their own.
+func (p *poolOutbound) recordPinFailure(member *memberState, cause error) {
+	if member.shared == nil || !p.blacklistFailedPin() || classifyFailure(cause) != faultPermanent {
+		p.recordFailure(member, cause)
+		return
+	}
+	until := member.shared.blacklistNow(cause, p.failurePolicy())
+	remaining := time.Until(until).Round(time.Second)
+	p.logger.Warn("proxy ", member.tag, " blacklisted for ", remaining, " after a session pin failed to dial: ", cause)
+	log.Printf("⚠️  [pool] %s BLACKLISTED for %s (session pin dial failure, until %s): %v", member.tag, remaining, until.Format("15:04:05"), cause)
+	log.Printf("    To release immediately, use WebUI or: POST /api/nodes/%s/release", member.tag)
 }
 
 func (p *poolOutbound) recordSuccess(member *memberState) {

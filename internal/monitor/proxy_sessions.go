@@ -3,6 +3,7 @@ package monitor
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -162,7 +163,7 @@ func (s *Server) handleProxySessionLinks(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if req.SessionID != "" && !routing.ValidSessionName(req.SessionID) {
-		writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": "session_id 须为 1 到 64 位字母、数字、下划线或短横线"})
+		writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("session_id 须为 1 到 %d 位字母、数字、下划线或短横线", routing.MaxSessionNameLength)})
 		return
 	}
 	cfg, store := s.proxyRoutingSnapshot()

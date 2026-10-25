@@ -726,7 +726,7 @@
                 <div class="form-group"><label for="proxyLinkMode">路由方式</label><select id="proxyLinkMode" class="setting-input" onchange="updateProxyLinkMode()"><option value="session">命名会话 · 固定出口</option><option value="normal">普通连接 · 按池调度</option></select></div>
                 <div class="form-group"><label for="proxyLinkScheme">代理协议</label><select id="proxyLinkScheme" class="setting-input" onchange="clearGeneratedLink()"><option value="http">HTTP / CONNECT</option><option value="socks5">SOCKS5</option></select></div>
               </div>
-              <div class="form-group" id="proxySessionIDField" style="margin-top:16px"><label for="proxySessionID">会话 ID</label><div class="session-id-row"><input type="text" id="proxySessionID" class="setting-input" maxlength="64" pattern="[A-Za-z0-9_-]{1,64}" required autocomplete="off" placeholder="例如 task_01" oninput="clearGeneratedLink()" /><button type="button" class="btn" onclick="randomizeSessionID()">随机生成</button></div><p class="form-help" id="sessionIDHelp">1–64 位英文字母、数字、下划线或连字符。完整用户名为 基础用户名.会话ID。</p></div>
+              <div class="form-group" id="proxySessionIDField" style="margin-top:16px"><label for="proxySessionID">会话 ID</label><div class="session-id-row"><input type="text" id="proxySessionID" class="setting-input" maxlength="100" pattern="[A-Za-z0-9_-]{1,100}" required autocomplete="off" placeholder="例如 task_01" oninput="clearGeneratedLink()" /><button type="button" class="btn" onclick="randomizeSessionID()">随机生成</button></div><p class="form-help" id="sessionIDHelp">1–100 位英文字母、数字、下划线或连字符。完整用户名为 基础用户名.会话ID。</p></div>
               <button type="submit" class="btn btn-primary" id="generateLinkBtn" style="margin-top:18px"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-link"/></svg> 生成接入链接</button>
               <div class="notice error-banner" id="linkError" role="alert" hidden style="margin-top:16px;margin-bottom:0"></div>
               <div class="generated-link" id="generatedLink" hidden><span class="form-help">接入 URL · 密码已遮蔽</span><code id="maskedProxyURL"></code><div class="copy-actions"><button type="button" class="btn" onclick="copyProxyLink('url')">复制完整 URL</button><button type="button" class="btn" onclick="copyProxyLink('curl')">复制 curl 命令</button></div><p class="form-help" style="margin-top:10px">复制内容包含真实凭据，请妥善保管；不会保存到浏览器本地存储。</p></div>
@@ -903,8 +903,9 @@
                 <div class="form-group"><label for="settingPoolBlacklist">黑名单时长</label><input type="text" id="settingPoolBlacklist" class="setting-input" placeholder="24h" /></div>
                 <div class="form-group"><label for="settingPoolTransient">暂时性故障冷却</label><input type="text" id="settingPoolTransient" class="setting-input" placeholder="60s" /></div>
                 <div class="form-group"><label for="settingPoolRateLimit">429 限流冷却</label><input type="text" id="settingPoolRateLimit" class="setting-input" placeholder="60s" /></div>
+                <div class="checkbox-row"><input type="checkbox" id="settingPoolBlacklistPin" /><label for="settingPoolBlacklistPin">绑定节点拨号失败时立即拉黑（命名会话）</label></div>
               </div>
-              <div style="font-size: 11px; color: var(--text-muted); padding: 0 16px 12px;">永久性故障（握手/证书/协议失败等）连续达到「故障阈值」后按「黑名单时长」拉黑。暂时性故障（超时、连接重置、503）和 429 限流不计入该阈值，只按对应冷却时间临时跳过该节点，到期自动恢复。支持 30s / 10m / 2h 等格式；想让 429 直接拉黑数小时，把「429 限流冷却」改成 2h 即可。</div>
+              <div style="font-size: 11px; color: var(--text-muted); padding: 0 16px 12px;">永久性故障（握手/证书/协议失败等）连续达到「故障阈值」后按「黑名单时长」拉黑。暂时性故障（超时、连接重置、503）和 429 限流不计入该阈值，只按对应冷却时间临时跳过该节点，到期自动恢复。支持 30s / 10m / 2h 等格式；想让 429 直接拉黑数小时，把「429 限流冷却」改成 2h 即可。开启「绑定节点拨号失败时立即拉黑」后，命名会话绑定的节点一旦拨号失败就立刻按「黑名单时长」拉黑，不必等故障阈值累计（429/超时类仍只冷却）。</div>
             </div>
 
             <div class="panel" style="margin-bottom: 16px;">
@@ -1983,9 +1984,9 @@
       const version = linkRequestVersion;
       const button = document.getElementById('generateLinkBtn');
       const sessionID = document.getElementById('proxyLinkMode').value === 'session' ? document.getElementById('proxySessionID').value.trim() : '';
-      if (document.getElementById('proxyLinkMode').value === 'session' && !/^[A-Za-z0-9_-]{1,64}$/.test(sessionID)) {
+      if (document.getElementById('proxyLinkMode').value === 'session' && !/^[A-Za-z0-9_-]{1,100}$/.test(sessionID)) {
         const error = document.getElementById('linkError');
-        error.textContent = '会话 ID 需为 1–64 位英文字母、数字、下划线或连字符。'; error.hidden = false;
+        error.textContent = '会话 ID 需为 1–100 位英文字母、数字、下划线或连字符。'; error.hidden = false;
         return;
       }
       linkGenerating = true; button.disabled = true;
@@ -2120,6 +2121,7 @@
         document.getElementById('settingPoolBlacklist').value = pl.blacklist_duration || '24h';
         document.getElementById('settingPoolTransient').value = pl.transient_cooldown || '60s';
         document.getElementById('settingPoolRateLimit').value = pl.rate_limit_cooldown || '60s';
+        document.getElementById('settingPoolBlacklistPin').checked = pl.blacklist_failed_pin !== false;
         // Sticky
         const st = d.sticky || {};
         document.getElementById('settingStickyEnabled').checked = !!st.enabled;
@@ -2263,6 +2265,7 @@
             blacklist_duration: document.getElementById('settingPoolBlacklist').value || '24h',
             transient_cooldown: document.getElementById('settingPoolTransient').value || '60s',
             rate_limit_cooldown: document.getElementById('settingPoolRateLimit').value || '60s',
+            blacklist_failed_pin: document.getElementById('settingPoolBlacklistPin').checked,
           },
           sticky: {
             enabled: document.getElementById('settingStickyEnabled').checked,

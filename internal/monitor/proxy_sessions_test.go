@@ -142,7 +142,7 @@ func TestProxySessionLinks(t *testing.T) {
 
 func TestProxySessionLinkValidation(t *testing.T) {
 	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
-	for _, id := range []string{"has.dot", "has space", "../node", "中文", "one@two", strings.Repeat("a", 65)} {
+	for _, id := range []string{"has.dot", "has space", "../node", "中文", "one@two", strings.Repeat("a", 101)} {
 		t.Run(id, func(t *testing.T) {
 			body, _ := json.Marshal(map[string]string{"session_id": id})
 			w := proxyAPIRequest(t, s, http.MethodPost, "/api/proxy-sessions/links", string(body))
@@ -157,9 +157,9 @@ func TestProxySessionLinkValidation(t *testing.T) {
 			t.Errorf("body=%q status=%d", body[:min(len(body), 80)], w.Code)
 		}
 	}
-	w := proxyAPIRequest(t, s, http.MethodPost, "/api/proxy-sessions/links", `{"session_id":"`+strings.Repeat("a", 64)+`"}`)
+	w := proxyAPIRequest(t, s, http.MethodPost, "/api/proxy-sessions/links", `{"session_id":"`+strings.Repeat("a", 100)+`"}`)
 	if w.Code != http.StatusOK {
-		t.Errorf("valid 64-byte ID: status=%d body=%s", w.Code, w.Body.String())
+		t.Errorf("valid 100-byte ID: status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -606,4 +606,43 @@ func TestMonitorShutdownClosesLongLivedHandlers(t *testing.T) {
 		t.Error("shutdown did not close the active streaming connection")
 	}
 	close(release)
+}
+
+func TestSettingsBlacklistFailedPinRoundTrip(t *testing.T) {
+	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
+	response := decodeProxyResponse(t, proxyAPIRequest(t, s, http.MethodGet, "/api/settings", ""))
+	if got := response["pool"].(map[string]any)["blacklist_failed_pin"]; got != true {
+		t.Fatalf("default blacklist_failed_pin = %v, want true", got)
+	}
+	cfg, path := loadProxySettingsFixture(t)
+	s.SetConfig(cfg)
+	w := proxyAPIRequest(t, s, http.MethodPut, "/api/settings", `{"pool":{"mode":"balance","failure_threshold":3,"blacklist_failed_pin":false}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("save: %d %s", w.Code, w.Body.String())
+	}
+	if cfg.Pool.BlacklistFailedPinOrDefault() {
+		t.Fatal("runtime settings kept the immediate pin blacklist enabled")
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Pool.BlacklistFailedPinOrDefault() {
+		t.Fatal("blacklist_failed_pin was not persisted")
+	}
+	// Omitting the field keeps the stored value; an explicit true re-enables it.
+	if w = proxyAPIRequest(t, s, http.MethodPut, "/api/settings", `{"external_ip":"other.example"}`); w.Code != http.StatusOK {
+		t.Fatalf("partial save: %d %s", w.Code, w.Body.String())
+	}
+	loaded, err = config.Load(path)
+	if err != nil || loaded.Pool.BlacklistFailedPinOrDefault() {
+		t.Fatalf("partial save reset blacklist_failed_pin: %+v, %v", loaded.Pool, err)
+	}
+	if w = proxyAPIRequest(t, s, http.MethodPut, "/api/settings", `{"pool":{"mode":"balance","failure_threshold":3,"blacklist_failed_pin":true}}`); w.Code != http.StatusOK {
+		t.Fatalf("re-enable save: %d %s", w.Code, w.Body.String())
+	}
+	loaded, err = config.Load(path)
+	if err != nil || !loaded.Pool.BlacklistFailedPinOrDefault() {
+		t.Fatalf("blacklist_failed_pin was not re-enabled: %+v, %v", loaded.Pool, err)
+	}
 }

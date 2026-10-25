@@ -206,6 +206,33 @@ func (s *sharedMemberState) recordFailure(cause error, policy failurePolicy) (in
 	return count, triggered, until, kind
 }
 
+// blacklistNow bans the node immediately instead of waiting for the failure
+// threshold. Callers use it for failures that prove the node cannot serve
+// traffic at all right now — a named session's pinned dial failing on a real
+// transport fault. An already-running longer ban is preserved, and the node
+// keeps its usual auto-clear/release paths.
+func (s *sharedMemberState) blacklistNow(cause error, policy failurePolicy) time.Time {
+	until := time.Now().Add(policy.BlacklistDuration)
+
+	s.mu.Lock()
+	if s.blacklisted && s.blacklistedUntil.After(until) {
+		until = s.blacklistedUntil
+	}
+	s.blacklisted = true
+	s.blacklistedUntil = until
+	s.banIsCooldown = false
+	s.failures = 0
+	s.mu.Unlock()
+
+	if entry := s.entry.Load(); entry != nil {
+		if cause != nil {
+			entry.RecordFailure(cause)
+		}
+		entry.Blacklist(until)
+	}
+	return until
+}
+
 func (s *sharedMemberState) recordSuccess() {
 	s.mu.Lock()
 	s.failures = 0

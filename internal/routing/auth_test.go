@@ -20,8 +20,8 @@ func TestParseUsername(t *testing.T) {
 		{"wang", "Wang.xxx", "", false},
 		{"wang", "wang.会话", "", false},
 		{"wang", "wang.bad name", "", false},
-		{"wang", "wang." + strings.Repeat("a", 64), strings.Repeat("a", 64), true},
-		{"wang", "wang." + strings.Repeat("a", 65), "", false},
+		{"wang", "wang." + strings.Repeat("a", 100), strings.Repeat("a", 100), true},
+		{"wang", "wang." + strings.Repeat("a", 101), "", false},
 		{"", ".xxx", "", false},
 	} {
 		t.Run(tt.input, func(t *testing.T) {

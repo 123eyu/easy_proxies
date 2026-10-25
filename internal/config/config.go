@@ -133,6 +133,10 @@ type PoolConfig struct {
 	// RetryEnabled toggles automatic fail-over to another member when a dial fails.
 	// nil/unset → default true. Use *bool so users can explicitly disable via YAML.
 	RetryEnabled *bool `yaml:"retry_enabled,omitempty"`
+	// BlacklistFailedPin blacklists a node immediately when a named session's
+	// pinned dial fails on a permanent fault, instead of waiting for
+	// FailureThreshold. nil/unset → default true.
+	BlacklistFailedPin *bool `yaml:"blacklist_failed_pin,omitempty"`
 	// RetryAttempts is the maximum total dial attempts per request (including the first).
 	// Default 3. Values <= 0 are normalized to 3.
 	// For pools with multiple members, each retry picks a different member when possible.
@@ -146,6 +150,15 @@ func (p PoolConfig) RetryEnabledOrDefault() bool {
 		return true
 	}
 	return *p.RetryEnabled
+}
+
+// BlacklistFailedPinOrDefault reports whether a failed session pin blacklists
+// its node immediately (default true).
+func (p PoolConfig) BlacklistFailedPinOrDefault() bool {
+	if p.BlacklistFailedPin == nil {
+		return true
+	}
+	return *p.BlacklistFailedPin
 }
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.

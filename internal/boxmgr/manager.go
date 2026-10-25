@@ -1269,6 +1269,10 @@ func (m *Manager) copyConfigLocked() *config.Config {
 		value := *m.cfg.Pool.RetryEnabled
 		cloned.Pool.RetryEnabled = &value
 	}
+	if m.cfg.Pool.BlacklistFailedPin != nil {
+		value := *m.cfg.Pool.BlacklistFailedPin
+		cloned.Pool.BlacklistFailedPin = &value
+	}
 	if m.cfg.Sticky.SessionEnabled != nil {
 		value := *m.cfg.Sticky.SessionEnabled
 		cloned.Sticky.SessionEnabled = &value

@@ -6,9 +6,13 @@ import (
 	"strings"
 )
 
+// MaxSessionNameLength bounds a session ID. The listener username plus the
+// separator and this ID must still fit the SOCKS5 255-byte credential field.
+const MaxSessionNameLength = 100
+
 // ValidSessionName reports whether name is a bounded, case-sensitive session ID.
 func ValidSessionName(name string) bool {
-	if len(name) < 1 || len(name) > 64 {
+	if len(name) < 1 || len(name) > MaxSessionNameLength {
 		return false
 	}
 	for _, ch := range []byte(name) {

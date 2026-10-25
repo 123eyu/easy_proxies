@@ -100,6 +100,10 @@ func cloneConfig(cfg *config.Config) *config.Config {
 		value := *cfg.Pool.RetryEnabled
 		copyCfg.Pool.RetryEnabled = &value
 	}
+	if cfg.Pool.BlacklistFailedPin != nil {
+		value := *cfg.Pool.BlacklistFailedPin
+		copyCfg.Pool.BlacklistFailedPin = &value
+	}
 	if cfg.Sticky.SessionEnabled != nil {
 		value := *cfg.Sticky.SessionEnabled
 		copyCfg.Sticky.SessionEnabled = &value

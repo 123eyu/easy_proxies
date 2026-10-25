@@ -122,3 +122,18 @@ func TestLegacyPortMigrationPrefersRetainedExactAlias(t *testing.T) {
 		t.Fatalf("retained node's exact port changed: %d", got)
 	}
 }
+
+func TestBlacklistFailedPinDefault(t *testing.T) {
+	var unset PoolConfig
+	if !unset.BlacklistFailedPinOrDefault() {
+		t.Fatal("unset blacklist_failed_pin must default to enabled")
+	}
+	disabled := false
+	if (PoolConfig{BlacklistFailedPin: &disabled}).BlacklistFailedPinOrDefault() {
+		t.Fatal("explicit false must disable the immediate pin blacklist")
+	}
+	enabled := true
+	if !(PoolConfig{BlacklistFailedPin: &enabled}).BlacklistFailedPinOrDefault() {
+		t.Fatal("explicit true must keep the immediate pin blacklist")
+	}
+}

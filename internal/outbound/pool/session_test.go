@@ -564,3 +564,64 @@ func TestSessionRoutingLegacyStickyAndOrdinaryScheduling(t *testing.T) {
 		})
 	}
 }
+
+// A session pinned to a node that stops answering must not be trapped there:
+// the pinned failure proves the binding stale, so the same request re-routes
+// even when retries are disabled, and the successful dial migrates the pin.
+func TestSessionRoutingPinnedFailureReroutesWithoutRetry(t *testing.T) {
+	a, b := newSessionTestOutbound("a"), newSessionTestOutbound("b")
+	p := newSessionTestPool(nil, a, b)
+	p.options.RetryEnabled = false
+	ctx := sessionTestContext(p, "account-session-stale-pin")
+	mustSessionTestDial(t, ctx, p, "a")
+	a.setDialHook(func(context.Context) error { return errors.New("fixture dial failure") })
+	mustSessionTestDial(t, ctx, p, "b")
+	got := sessionTestBinding(t, p.sessionStore, "account-session-stale-pin")
+	if got.NodeID != "identity-b" || got.NodeTag != "b" || got.SwitchCount != 1 || got.LastReason != "dial_failed" {
+		t.Fatalf("stale pin was not migrated: %+v", got)
+	}
+	// The healthiest node is preferred first; a is only retried after b fails.
+	a.setDialHook(nil)
+	mustSessionTestDial(t, ctx, p, "b")
+	if calls, _, _ := a.counts(); calls != 2 {
+		t.Fatalf("failed pin caused %d dials through a, want 2", calls)
+	}
+}
+
+// A single-member pool has nothing to re-route to, so the request still fails
+// once instead of looping on the broken node, and no binding is fabricated.
+func TestSessionRoutingPinnedFailureSingleMemberDoesNotLoop(t *testing.T) {
+	a := newSessionTestOutbound("a")
+	p := newSessionTestPool(nil, a)
+	p.options.RetryEnabled = false
+	ctx := sessionTestContext(p, "account-session-single")
+	mustSessionTestDial(t, ctx, p, "a")
+	before := sessionTestBinding(t, p.sessionStore, "account-session-single")
+	a.setDialHook(func(context.Context) error { return errors.New("fixture dial failure") })
+	if _, err := sessionTestDialTag(ctx, p); err == nil {
+		t.Fatal("single-member pool dial unexpectedly succeeded")
+	}
+	if calls, _, _ := a.counts(); calls != 2 {
+		t.Fatalf("a dial calls = %d, want 2", calls)
+	}
+	assertSessionTestSamePin(t, sessionTestBinding(t, p.sessionStore, before.ID), before)
+}
+
+// Lookups are observational: only a successful dial renews a binding, so a
+// session whose every dial fails can idle out instead of living forever.
+func TestSessionRoutingFailedLookupDoesNotExtendIdleTTL(t *testing.T) {
+	a, b := newSessionTestOutbound("a"), newSessionTestOutbound("b")
+	p := newSessionTestPool(nil, a, b)
+	ctx := sessionTestContext(p, "account-session-idle")
+	mustSessionTestDial(t, ctx, p, "a")
+	before := sessionTestBinding(t, p.sessionStore, "account-session-idle")
+	fail := func(context.Context) error { return errors.New("fixture dial failure") }
+	a.setDialHook(fail)
+	b.setDialHook(fail)
+	for i := 0; i < 3; i++ {
+		if _, err := sessionTestDialTag(ctx, p); err == nil {
+			t.Fatal("all failed dials unexpectedly succeeded")
+		}
+	}
+	assertSessionTestSamePin(t, sessionTestBinding(t, p.sessionStore, before.ID), before)
+}
